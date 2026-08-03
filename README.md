@@ -163,3 +163,11 @@ deepresearch/
 | 嵌入模型 | sentence-transformers (all-MiniLM-L6-v2) |
 | 持久化 | SQLite + numpy 向量索引 |
 | 可观测性 | LangSmith（可选） |
+
+---
+
+## 联系我们
+
+欢迎提交 Issue 和 PR！无论是 bug 修复、功能增强还是文档改进，我们都非常感谢。具体可以联系：
+
+📧 [502025150001@smail.nju.edu.cn](mailto:502025150001@smail.nju.edu.cn)

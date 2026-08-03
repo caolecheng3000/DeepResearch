@@ -1,0 +1,27 @@
+# Environment & Secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data
+data/*.db
+data/*.sqlite
+
+# Outputs
+outputs/reports/*.md
+outputs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

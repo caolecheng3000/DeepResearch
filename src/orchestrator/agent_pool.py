@@ -140,8 +140,6 @@ class AgentPool:
             return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns)
         elif type_key == TaskType.ANALYZE.value:
             return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns)
-        elif type_key == TaskType.VERIFY.value:
-            return ResearcherAgent(name=f"verifier_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns)
         elif type_key == "synthesize":
             return SummarizerAgent(name="summarizer", policy=policy, tools=tools)
         else:
@@ -154,6 +152,6 @@ class AgentPool:
         cls_name = agent.__class__.__name__
         if "Summarizer" in cls_name:
             return "synthesize"
-        # ResearcherAgent 用于 search/analyze/verify，统一归到 search
+        # ResearcherAgent 用于 search/analyze，统一归到 search
         from .schemas import TaskType
         return TaskType.SEARCH.value

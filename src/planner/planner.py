@@ -56,7 +56,7 @@ Return a JSON object with this exact structure (no markdown, no extra text):
 }}
 
 ## Rules
-1. task_type must be one of: search, analyze, verify
+1. task_type must be one of: search, analyze
 2. dependencies must reference existing task_id values
 3. The graph must be a DAG (no cycles)
 4. Generate 4 to 8 sub_tasks
@@ -129,33 +129,105 @@ class Planner:
     def generate_plan(self, query: str, memory_context: str = "") -> DAG:
         """生成初始执行计划（DAG）。
 
-        Args:
-            query: 原始研究问题。
-            memory_context: 历史上下文（首次规划为空字符串）。
-
-        Returns:
-            DAG: 子任务依赖图。
+        带 Schema 校验：LLM 输出格式不合法时自动回传错误并重试（最多 2 次）。
 
         Raises:
             PlanParseError: LLM 输出无法解析为合法 DAG 时抛出。
         """
+        from src.utils.schema_validator import validate_planner_output
+        import json as _json
+
         prompt = self._build_prompt(query, memory_context)
-        messages = [
+        messages: list[dict] = [
             {"role": "system", "content": "You are a research planning assistant. Output valid JSON only."},
             {"role": "user", "content": prompt},
         ]
 
-        try:
-            response = self.policy(messages)
-        except RuntimeError as e:
-            raise PlanParseError(f"LLM call failed during planning: {e}") from e
+        content = ""
+        data = None
+        for attempt in range(3):  # 原始调用 + 2 次重试
+            try:
+                response = self.policy(messages)
+                content = response.get("content", "") or ""
+            except RuntimeError as e:
+                if attempt < 2:
+                    messages.append({
+                        "role": "user",
+                        "content": f"调用失败: {e}。请重试，只输出合法 JSON。"
+                    })
+                    continue
+                raise PlanParseError(f"LLM call failed during planning: {e}") from e
 
-        content = response.get("content", "") or ""
+            # 尝试解析 JSON
+            data = self._try_parse_json(content)
+            if data is not None:
+                # Schema 校验
+                validation = validate_planner_output(data)
+                if validation.valid:
+                    break
+                # 校验失败 → 回传错误重试
+                if attempt < 2:
+                    messages.append({"role": "user", "content": validation.to_feedback()})
+                data = None  # 重置，触发下次重试
+            elif attempt < 2:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "⚠️ 你的上次输出不是合法的 JSON 格式。"
+                        "请只输出 JSON 对象，不要包含任何其他文字。"
+                    )
+                })
+
         self._last_raw_json = content
-        # 估算 planning token 消耗
         self.budget_tracker.track(len(content) // 3)
 
-        return self._parse_plan(content)
+        if data is not None:
+            return self._build_dag_from_data(data)
+        return self._parse_plan(content)  # 降级：用原有容错解析
+
+    def _try_parse_json(self, raw: str) -> dict | None:
+        """尝试从 LLM 原始输出中解析 JSON 对象。"""
+        import json as _json
+        raw = raw.strip()
+        try:
+            return _json.loads(raw)
+        except _json.JSONDecodeError:
+            pass
+        # 提取 ```json 代码块
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if m:
+            try:
+                return _json.loads(m.group(1).strip())
+            except _json.JSONDecodeError:
+                pass
+        # 提取 {...}
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                return _json.loads(m.group(0))
+            except _json.JSONDecodeError:
+                pass
+        return None
+
+    def _build_dag_from_data(self, data: dict) -> DAG:
+        """从校验通过的 dict 构建 DAG（跳过 JSON 解析，直接构建）。"""
+        sub_tasks_raw = data.get("sub_tasks", [])
+        dag = DAG()
+        for item in sub_tasks_raw:
+            task = self._deserialize_subtask(item)
+            dag.add_node(task.task_id)
+        for item in sub_tasks_raw:
+            task_id = item.get("task_id", "")
+            for dep in item.get("dependencies", []):
+                if not dag.has_node(dep):
+                    dag.add_node(dep)
+                dag.add_edge(dep, task_id)
+        # 验证无环
+        try:
+            dag.topological_sort()
+        except DAGCycleError as e:
+            raise PlanParseError(f"Planner generated a cyclic graph: {e}") from e
+        return dag
 
     @trace_chain(name="planner.replan", tags=["m2", "planner"])
     def replan(
@@ -165,7 +237,7 @@ class Planner:
         existing_results: list[AgentResult],
         reason: str,
     ) -> DAG:
-        """增量重规划：保留高置信度结果，修改失败任务。
+        """增量重规划：保留高置信度结果，修改失败任务（带 Schema 校验 + retry）。
 
         Args:
             query: 原始研究问题。
@@ -176,6 +248,7 @@ class Planner:
         Returns:
             DAG: 新的执行计划。
         """
+        from src.utils.schema_validator import validate_planner_output
         # 筛选保留的结果（confidence >= 0.6 且状态为 SUCCESS）
         preserved = [
             {
@@ -205,15 +278,43 @@ class Planner:
             {"role": "user", "content": prompt},
         ]
 
-        try:
-            response = self.policy(messages)
-        except RuntimeError as e:
-            raise PlanParseError(f"LLM call failed during replanning: {e}") from e
+        content = ""
+        data = None
+        for attempt in range(3):
+            try:
+                response = self.policy(messages)
+                content = response.get("content", "") or ""
+            except RuntimeError as e:
+                if attempt < 2:
+                    messages.append({
+                        "role": "user",
+                        "content": f"调用失败: {e}。请重试，只输出合法 JSON。"
+                    })
+                    continue
+                raise PlanParseError(f"LLM call failed during replanning: {e}") from e
 
-        content = response.get("content", "") or ""
+            data = self._try_parse_json(content)
+            if data is not None:
+                validation = validate_planner_output(data)
+                if validation.valid:
+                    break
+                if attempt < 2:
+                    messages.append({"role": "user", "content": validation.to_feedback()})
+                data = None
+            elif attempt < 2:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "⚠️ 你的上次输出不是合法的 JSON 格式。"
+                        "请只输出 JSON 对象，不要包含任何其他文字。"
+                    )
+                })
+
         self._last_raw_json = content
         self.budget_tracker.track(len(content) // 3)
 
+        if data is not None:
+            return self._build_dag_from_data(data)
         return self._parse_plan(content)
 
     # ------------------------------------------------------------------

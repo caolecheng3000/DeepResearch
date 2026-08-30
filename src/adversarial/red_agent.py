@@ -323,6 +323,8 @@ class RedAgent:
     ) -> tuple[str, str, list[tuple[str, float, list[Issue]]]]:
         """评估单个组合维度（在 asyncio.gather 中并行执行）。
 
+        带 Schema 校验：LLM 输出格式不合法时自动回传错误并重试（最多 2 次）。
+
         Returns:
             (dimension_name, raw_response, [(sub_key, score, issues), ...])
         """
@@ -331,21 +333,58 @@ class RedAgent:
         prompt = prompt.replace("{content}", content)
         prompt = prompt.replace("{sources}", sources)
 
-        messages = [
+        messages: list[dict] = [
             {"role": "system", "content": SYSTEM_RED_AGENT},
             {"role": "user", "content": prompt},
         ]
 
-        try:
-            resp = self.policy(messages)
-            raw = resp.content or ""
-        except Exception as e:
-            return (name, f"ERROR: {e}", [])
+        # 确定该组合维度应包含的子维度 key（用于校验）
+        if name == "factual_hallucination":
+            expected_keys = ["factual_accuracy", "hallucination"]
+        elif name == "logical":
+            expected_keys = ["logical"]
+        elif name == "source_coverage":
+            expected_keys = ["source_credibility", "coverage"]
+        else:
+            expected_keys = []
 
-        # 解析组合 JSON → 各子维度
+        # Schema 校验 + 重试
+        from src.utils.schema_validator import (
+            validate_red_agent_output,
+            retry_with_schema_feedback,
+        )
+
+        async def _call_policy(msgs):
+            return self.policy(msgs)
+
+        data = await retry_with_schema_feedback(
+            policy_call=_call_policy,
+            messages=messages,
+            validate_fn=lambda d: validate_red_agent_output(d, expected_keys),
+            max_retries=2,
+        )
+
+        # Schema 校验全部失败 → 降级：用原始解析
+        if data is None:
+            try:
+                resp = self.policy(messages[:2])  # 用初始 messages 重试最后一次
+                raw = resp.content or ""
+            except Exception:
+                raw = "{}"
+            parsed = self._parse_combined_json(raw)
+        else:
+            # 校验通过，但需要确保缺失的子维度有兜底分数
+            raw = str(data)
+            parsed = {}
+            for key in expected_keys:
+                sub = data.get(key, {})
+                if isinstance(sub, dict):
+                    parsed[key] = sub
+                else:
+                    parsed[key] = {"score": 5.0, "issues": []}
+
+        # 解析各子维度
         sub_results: list[tuple[str, float, list[Issue]]] = []
-        parsed = self._parse_combined_json(raw)
-
         for sub_key, sub_data in parsed.items():
             dim = _SUB_DIMENSION_MAP.get(sub_key)
             if dim is None:

@@ -159,7 +159,7 @@ class Orchestrator:
                     from src.memory.long_term import MemoryEntry
                     entry = MemoryEntry(
                         entry_id=f"final_report:{int(time.time())}",
-                        claim=str(report.content)[:800],
+                        claim=self._smart_truncate(str(report.content), max_chars=1200),
                         source="orchestrator",
                         confidence=report.confidence,
                         agent_id="orchestrator",
@@ -175,6 +175,9 @@ class Orchestrator:
                     )
                     self.memory_store.put(entry)
                     print(f"[M4] Final report stored to memory (confidence={report.confidence:.2f})")
+
+                    # M3+L3: M4 容量 >85% 时用 LLM 摘要压缩旧记忆
+                    await self._maybe_compress_old_memories()
                 except Exception as e:
                     print(f"[M4] Failed to store final report: {e}")
 
@@ -289,7 +292,6 @@ class Orchestrator:
             for lr in layer_results:
                 if isinstance(lr, Exception):
                     # 将异常包装为 FAILED 结果
-                    # 这种情况理论上不会发生（_run_one 内部已捕获），但保险起见
                     all_results.append(AgentResult(
                         task_id="unknown",
                         status=AgentStatus.FAILED,
@@ -297,6 +299,9 @@ class Orchestrator:
                     ))
                 else:
                     all_results.append(lr)
+                    # 每层结束后立即写入 _memory_store，使下层可见依赖结果
+                    if isinstance(lr, AgentResult):
+                        self._memory_store[f"result:{lr.task_id}"] = lr
 
         self._results = all_results
         return OrchestratorState.COLLECTING
@@ -373,7 +378,7 @@ class Orchestrator:
             from src.memory.long_term import MemoryEntry
 
             # 1. 智能截断 claim：在最后完整句子边界处切断
-            claim_text = self._smart_truncate(str(result.output), max_chars=500)
+            claim_text = self._smart_truncate(str(result.output), max_chars=1200)
 
             # 2. 从 trajectory 提取真实来源 URL
             source = self._extract_source_from_trajectory(result)
@@ -489,6 +494,95 @@ class Orchestrator:
         if titles:
             return titles[0][:200]
         return f"task:{result.task_id}"
+
+    async def _maybe_compress_old_memories(self) -> None:
+        """M3 L3: M4 容量 >85% 时，用 LLM 摘要压缩最旧的记忆。
+
+        策略：
+        - 保留最近 50% 的记忆不变
+        - 将较旧的 50% 记忆用 LLMSummarizer 聚合为一份摘要
+        - 删除旧记忆，插入摘要条目
+        - 避免 M4 无限膨胀导致语义检索质量下降
+        """
+        if self.memory_store is None or self.compressor is None:
+            return
+
+        max_entries = 10000  # 与 config memory.max_entries 一致
+        current_count = len(self.memory_store)
+        if current_count < max_entries * 0.85:
+            return
+
+        try:
+            # 获取所有记忆，按时间排序
+            all_entries = self.memory_store.lt.get_all_entries()
+            if len(all_entries) < 20:  # 太少不值得压缩
+                return
+            all_entries.sort(key=lambda e: e.timestamp)
+
+            # 保留最近 50%，压缩较旧 50%
+            keep_count = max(current_count // 2, 10)
+            old_entries = all_entries[: current_count - keep_count]
+
+            if len(old_entries) < 5:  # 旧记忆太少，不值得压缩
+                return
+
+            # 收集旧记忆的 claim 文本
+            old_texts = [e.claim for e in old_entries if e.claim]
+
+            print(
+                f"[M3] Compressing {len(old_texts)} old memories "
+                f"(M4 usage {current_count}/{max_entries}, {current_count/max_entries:.0%})"
+            )
+
+            # L3: 用 LLM 将旧记忆聚合为一份摘要
+            aggregate = self.compressor.summarizer.summarize_documents(
+                old_texts,
+                query=self._query,
+                max_length=max(800, min(3000, len(old_texts) * 30)),
+            )
+
+            if not aggregate or len(aggregate) < 100:
+                print("[M3] L3 compression produced empty result, skipping")
+                return
+
+            # 删除旧记忆（使用同一个连接）
+            conn = self.memory_store.lt._connect()
+            try:
+                for e in old_entries:
+                    self.memory_store._remove_from_index(e.entry_id)
+                    conn.execute(
+                        "DELETE FROM entries WHERE entry_id = ?", (e.entry_id,)
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            # 插入压缩摘要作为新记忆
+            from src.memory.long_term import MemoryEntry
+            import time as _time
+            compressed_entry = MemoryEntry(
+                entry_id=f"compressed:{int(_time.time())}",
+                claim=aggregate[:1200],
+                source="m3_compressor",
+                confidence=0.6,
+                agent_id="orchestrator",
+                timestamp=_time.time(),
+                evidence_type="secondary",
+                embedding=[],
+                topic=f"compressed_{self._query[:40]}",
+                metadata={
+                    "compressed_from": len(old_entries),
+                    "original_timestamps": [e.timestamp for e in old_entries[:5]],
+                },
+            )
+            self.memory_store.put(compressed_entry)
+
+            print(
+                f"[M3] Compressed {len(old_entries)} old memories into 1 summary entry "
+                f"({len(aggregate)} chars). M4: {current_count} → {len(self.memory_store)} entries"
+            )
+        except Exception as e:
+            print(f"[M3] Memory compression failed: {e}")
 
     async def _do_synthesizing(self) -> OrchestratorState:
         """调用 SummarizerAgent 合成研究报告。"""

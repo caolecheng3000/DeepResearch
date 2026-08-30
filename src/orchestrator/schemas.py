@@ -49,7 +49,6 @@ class TaskType(Enum):
     """Sub-task 的任务类型，决定由哪类 Agent 执行。"""
     SEARCH = "search"
     ANALYZE = "analyze"
-    VERIFY = "verify"
 
 
 class AgentStatus(Enum):

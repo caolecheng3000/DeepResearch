@@ -234,11 +234,25 @@ class BlueAgent:
         )
 
         supplementary_count = 0  # SUPPLEMENTARY 修复计数器（每轮最多 3 次）
+        verify_reject_count: dict[str, int] = {}  # 每个 issue 被 verify 拒绝的次数
         total_issues = len(sorted_issues)
         fix_type_counts = {"in_place": 0, "search": 0, "removal": 0, "skipped": 0}
 
         for issue in sorted_issues:
             fix_type_counts[issue.fix_type.value] = fix_type_counts.get(issue.fix_type.value, 0) + 1
+
+            # 同一个 issue 修复被 verify 拒绝 3 次 → 永久跳过
+            issue_key = issue.description[:80] if issue.description else "unknown"
+            if verify_reject_count.get(issue_key, 0) >= 2:
+                fix_type_counts["skipped"] = fix_type_counts.get("skipped", 0) + 1
+                op = FixOperation(
+                    issue=issue,
+                    action="permanently_skipped",
+                    success=False,
+                    detail=f"Fix rejected 3 times by verify: {issue_key[:60]}",
+                )
+                operations.append(op)
+                continue
 
             # SUPPLEMENTARY 修复每轮最多执行 3 次（避免大量搜索调用）
             if issue.fix_type == FixType.SUPPLEMENTARY:
@@ -276,28 +290,67 @@ class BlueAgent:
                 op.success = False
                 op.detail = f"REJECTED (truncation detected: {original_len}→{new_len} chars): {op.detail[:200]}"
 
-            # self_verify：检查修复是否引入新矛盾
+            # self_verify：检查修复是否引入新矛盾，按严重程度分级处理
             verify_pass, verify_issues = await self._self_verify(
                 original_content, current.content, operations
             )
             if not verify_pass:
-                # 引入新问题：记录但继续（优先处理高优先级 issue，避免死锁）
-                for vi in verify_issues:
-                    operations.append(
-                        FixOperation(
+                # 分离严重/重要问题 与 轻微问题
+                blockers = [vi for vi in verify_issues
+                            if vi.severity in (Severity.CRITICAL, Severity.MAJOR)]
+                minors = [vi for vi in verify_issues
+                          if vi.severity == Severity.MINOR]
+
+                # 用 issue 的描述前 80 字作为去重键
+                issue_key = issue.description[:80] if issue.description else "unknown"
+
+                if blockers:
+                    # 严重/重要问题 → 拒绝修复，回退内容
+                    current.content = content_before_fix
+                    op.success = False
+                    verify_reject_count[issue_key] = verify_reject_count.get(issue_key, 0) + 1
+                    reject_n = verify_reject_count[issue_key]
+                    blocker_desc = "; ".join(b.description[:60] for b in blockers[:3])
+                    op.detail = (
+                        f"REJECTED (verify found {len(blockers)} major/critical issues, "
+                        f"attempt {reject_n}/3): {blocker_desc}"
+                    )
+                    logger.warning(
+                        f"[BlueAgent] Fix REJECTED for '{issue_key[:40]}': "
+                        f"{len(blockers)} major/critical issues (attempt {reject_n}/3)"
+                    )
+                    # 记录被拒绝的问题供审计
+                    for vi in verify_issues:
+                        operations.append(FixOperation(
                             issue=vi,
-                            action="self_verify_detected_new_issue",
+                            action=f"verify_rejected_attempt_{reject_n}",
                             success=False,
                             detail=vi.description,
-                        )
+                        ))
+
+                elif minors:
+                    # 仅有轻微问题 → 接受修复，记录供审计
+                    op.detail += f"; verify noted {len(minors)} minor issue(s)"
+                    for mi in minors:
+                        operations.append(FixOperation(
+                            issue=mi,
+                            action="verify_minor_accepted",
+                            success=True,
+                            detail=mi.description,
+                        ))
+                    logger.info(
+                        f"[BlueAgent] Fix accepted with {len(minors)} minor verify issue(s)"
                     )
 
+        verify_rejected = sum(1 for op in operations
+                              if op.action and "verify_rejected" in str(op.action))
         logger.info(
             f"[BlueAgent] defend done: {total_issues} issues → "
             f"IN_PLACE={fix_type_counts.get('in_place', 0)}, "
             f"SUPP_SEARCH={fix_type_counts.get('search', 0)} "
             f"(executed={supplementary_count}, skipped={fix_type_counts.get('skipped', 0)}), "
-            f"REMOVAL={fix_type_counts.get('removal', 0)}"
+            f"REMOVAL={fix_type_counts.get('removal', 0)}, "
+            f"verify_rejected={verify_rejected}"
         )
         return current, operations
 
@@ -329,10 +382,41 @@ class BlueAgent:
 
         return result
 
+    async def _call_fix_with_schema_retry(
+        self, messages: list[dict], fix_type: str, raw_retry: int = 0
+    ) -> tuple[str, list[dict]]:
+        """调用 LLM 修复 → 解析 JSON → Schema 校验 → 失败则重试。
+
+        Returns:
+            (fixed_content, changes_or_removed_list)
+        """
+        from src.utils.schema_validator import (
+            validate_blue_fix_output,
+            retry_with_schema_feedback,
+        )
+
+        async def _call(msgs):
+            return self.policy(msgs)
+
+        data = await retry_with_schema_feedback(
+            policy_call=_call,
+            messages=messages,
+            validate_fn=lambda d: validate_blue_fix_output(d, fix_type),
+            max_retries=2,
+        )
+
+        if data is None:
+            return "", []
+
+        fc = data.get("fixed_content", "")
+        if fix_type == "removal":
+            return fc, data.get("removed_segments", [])
+        return fc, data.get("changes", [])
+
     async def _do_in_place_fix(
         self, report: ResearchReport, issue: Issue
     ) -> FixOperation:
-        """执行原地修正。"""
+        """执行原地修正（带 Schema 校验 + retry）。"""
         prompt = PROMPT_IN_PLACE_FIX
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", self._truncate_content(report.content))
@@ -341,10 +425,10 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
-        raw = resp.content or ""
 
-        fixed_content, changes = self._parse_fix_json(raw)
+        fixed_content, changes = await self._call_fix_with_schema_retry(
+            messages, fix_type="in_place"
+        )
         if fixed_content:
             report.content = fixed_content
             return FixOperation(
@@ -357,7 +441,7 @@ class BlueAgent:
             issue=issue,
             action="in_place_fix_failed",
             success=False,
-            detail=raw[:500],
+            detail="Schema validation failed after retries",
         )
 
     async def _do_supplementary_search(
@@ -396,10 +480,9 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
-        raw = resp.content or ""
-
-        fixed_content, changes = self._parse_fix_json(raw)
+        fixed_content, changes = await self._call_fix_with_schema_retry(
+            messages, fix_type="in_place"
+        )
         if fixed_content:
             report.content = fixed_content
             return FixOperation(
@@ -412,13 +495,13 @@ class BlueAgent:
             issue=issue,
             action="supplementary_search_failed",
             success=False,
-            detail=raw[:500],
+            detail="Schema validation failed after retries",
         )
 
     async def _do_removal(
         self, report: ResearchReport, issue: Issue
     ) -> FixOperation:
-        """执行移除修正。"""
+        """执行移除修正（带 Schema 校验 + retry）。"""
         prompt = PROMPT_REMOVAL
         prompt = prompt.replace("{issue_desc}", issue.description)
         prompt = prompt.replace("{content}", self._truncate_content(report.content))
@@ -426,10 +509,10 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
-        raw = resp.content or ""
 
-        fixed_content, removed = self._parse_removal_json(raw)
+        fixed_content, removed = await self._call_fix_with_schema_retry(
+            messages, fix_type="removal"
+        )
         if fixed_content:
             report.content = fixed_content
             return FixOperation(
@@ -442,7 +525,7 @@ class BlueAgent:
             issue=issue,
             action="removal_failed",
             success=False,
-            detail=raw[:500],
+            detail="Schema validation failed after retries",
         )
 
     async def _self_verify(

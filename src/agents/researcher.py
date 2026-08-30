@@ -420,16 +420,45 @@ class ResearcherAgent(BaseAgent):
             "",
             f"## RECOMMENDED TOOLS (in priority order): {', '.join(tool_recommendations)}",
         ]
-        
+
         if secondary_tools:
             lines.append(f"Start with '{primary_tool}'. If the task involves numbers/calculations, also use {', '.join(secondary_tools)}.")
         else:
             lines.append(f"Use '{primary_tool}' to gather information.")
-        
+
+        # 按任务类型追加差异化指令（区分 search 收集信息 vs analyze 综合分析）
+        if task.task_type.value == "search":
+            lines.extend([
+                "",
+                "## 任务目标：信息检索",
+                "本任务是【信息检索】任务，目标是收集尽可能全面、准确的事实性信息。",
+                "请积极调用搜索工具，多轮检索，覆盖不同角度和数据源。",
+            ])
+        elif task.task_type.value == "analyze":
+            lines.extend([
+                "",
+                "## 任务目标：综合分析",
+                "本任务是【综合分析】任务，目标是对已有信息进行推理、比较、归纳、得出结论。",
+                "请优先阅读下方 Context 中的上游任务结果，基于它们进行分析，而非从头重新搜索。",
+                "仅在上下文信息明显不足时才补充搜索。",
+            ])
+
+        # 根据任务类型定制首条指令
+        if task.task_type.value == "analyze":
+            first_instruction = (
+                f"1. First, READ the Context (upstream task results) below. "
+                f"If the information is sufficient, analyze directly. "
+                f"Only if insufficient, call '{primary_tool}' to supplement."
+            )
+        else:
+            first_instruction = (
+                f"1. First, call the '{primary_tool}' tool with a relevant query to gather information."
+            )
+
         lines.extend([
             "",
             "## INSTRUCTIONS:",
-            f"1. First, call the '{primary_tool}' tool with a relevant query to gather information.",
+            first_instruction,
             "2. Review the results.",
             f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
             "   You may call tools AT MOST 3 times total. After the 3rd call, you MUST write the final summary.",
@@ -443,15 +472,34 @@ class ResearcherAgent(BaseAgent):
         ])
         if task.search_hints:
             lines.insert(1, f"Search hints (MUST use these as primary keywords): {', '.join(task.search_hints)}")
-        if task.context_keys:
+
+        # 修复：用 dependencies 注入的 dep:{id} 展示依赖结果（而非 context_keys）
+        if task.dependencies:
             ctx_parts = []
-            for key in task.context_keys:
-                if key in context:
-                    ctx_parts.append(f"- {key}: {context[key]}")
+            for dep_id in task.dependencies:
+                dep_key = f"dep:{dep_id}"
+                if dep_key in context:
+                    dep_text = self._extract_dependency_text(context[dep_key])
+                    if dep_text.strip():
+                        ctx_parts.append(f"【上游任务 {dep_id} 的结果】\n{dep_text}")
             if ctx_parts:
-                lines.append("\n## Context:")
+                lines.append("\n## Context (上游任务结果，请优先基于这些信息进行分析):")
                 lines.extend(ctx_parts)
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_dependency_text(value: Any) -> str:
+        """从依赖结果中提取文本。兼容 AgentResult / dict / str 三种类型。"""
+        if value is None:
+            return ""
+        # AgentResult 对象
+        if hasattr(value, "output"):
+            return str(value.output or "")[:800]
+        # dict
+        if isinstance(value, dict) and "output" in value:
+            return str(value["output"] or "")[:800]
+        # 字符串或其他
+        return str(value)[:800]
 
     async def _execute_tool(self, tool_name: str, args: dict) -> dict:
         """调用具体工具实例。"""

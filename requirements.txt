@@ -19,7 +19,11 @@
 # ---------------------------------------------------------------------------
 
 # LLM 客户端：调用 DeepSeek / OpenAI / vLLM 等 OpenAI 兼容 API
-openai>=1.0
+# Keep the SDK on the major versions supported by the HTTP transport tests.
+openai>=1.0,<3
+
+# Explicit dependency for offline MockTransport cancellation/response tests.
+httpx>=0.27,<1
 
 # HuggingFace 生态：Tokenizer、模型加载
 transformers>=4.40

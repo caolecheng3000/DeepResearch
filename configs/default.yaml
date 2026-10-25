@@ -5,6 +5,20 @@
 # 子模块可以通过加载此文件并覆盖特定键来实现自定义配置。
 # =============================================================================
 
+recovery:
+  # Five levels: repair -> retry -> fallback -> existing Replan -> terminate.
+  max_attempts: 3                 # Initial execution + 2 retries, read-only tools only
+  max_repairs: 1                  # Model argument repairs per Worker
+  max_fallbacks: 2                # Backend / equivalent-tool switches per Worker
+  max_task_tool_calls: 12         # Includes retries and backend attempts
+  max_run_tool_calls: 96          # Shared across Workers, Planner and Blue
+  max_run_model_calls: 64         # All call_policy calls, including retries
+  max_recovery_actions: 32        # Shared repairs, retries, switches and Replan
+  max_estimated_tokens: 1000000   # Request-size estimate + output reservations, not billed usage
+  base_delay: 1.0
+  max_delay: 8.0
+  jitter: 0.2
+
 system:
   # 系统名称与版本号
   name: "DeepResearchAgent"
@@ -57,9 +71,11 @@ model:
   # ---------------------------------------------------------------------------
   backend_sampling:
     # DeepSeek 后端的全局默认采样参数
+    # 注意：deepseek-v4-flash 是推理模型，max_tokens 限制「思维链+最终答案」总量，
+    # 复杂 query 的思维链可达 2 万字，max_tokens 太小会导致最终答案(content)为空
     deepseek:
       temperature: 0.7
-      max_tokens: 4096
+      max_tokens: 16384
       top_p: 1.0
 
     # MiMo 后端的全局默认采样参数
@@ -73,7 +89,7 @@ model:
     modules:
       planner:
         temperature: 0.3       # 生成 JSON DAG 需要确定性
-        max_tokens: 4096
+        max_tokens: 8192       # 推理模型需为思维链预留空间
       solver:
         temperature: 0.7       # 研究需要一定创造性
         max_tokens: 12288      # 子任务输出更详细（供M3压缩后使用）
@@ -82,16 +98,16 @@ model:
         max_tokens: 32768      # 给长报告足够 token 预算
       red_agent:
         temperature: 0.1       # 攻击必须严谨，几乎不需要随机性
-        max_tokens: 4096
+        max_tokens: 8192       # 推理模型需为思维链预留空间
       blue_agent:
         temperature: 0.3       # 修复需要确定性
-        max_tokens: 4096
+        max_tokens: 8192       # 输出 fixed_content 全文，需预留思维链空间
       judge:
         temperature: 0.1       # 评分标准必须一致，避免漂移
-        max_tokens: 2048
+        max_tokens: 8192       # 推理模型需为思维链预留空间，否则 content 为空
       compressor:
         temperature: 0.1       # 摘要是结构化任务
-        max_tokens: 2048
+        max_tokens: 8192       # 推理模型需为思维链预留空间
 
   # ---------------------------------------------------------------------------
   # 后端分工映射（哪个模块用哪个后端）
@@ -120,11 +136,27 @@ orchestrator:
   max_subagent_retries: 2
   # 每个 Researcher 最多调用工具轮数（越大=信息越多=耗时越长）
   researcher_max_turns: 15
+  # 合成报告最小字符提示；小样本评测可单独调低，不修改正式运行默认值
+  report_min_chars: 5000
 
 planner:
   # M2: Adaptive Planner 配置
   # 每个子 Agent 最多允许的搜索/执行轮数
   max_search_rounds_per_subagent: 5
+  # ---------------------------------------------------------------------------
+  # 规划前侦察（Reconnaissance）
+  # ---------------------------------------------------------------------------
+  # 在生成任务 DAG 之前，先用固定次数的搜索工具调用获取真实情报，
+  # 让子任务拆解和 search_hints 建立在事实而非模型先验之上。
+  # 0 = 关闭侦察，退化为纯 LLM 规划（与历史行为完全一致）
+  # 1 = 默认，1 次检索 + 1 次规划，共 2 次 LLM 调用
+  # 2 = 更充分的情报，但延迟与配额消耗线性增加
+  search_calls: 1
+  # 侦察阶段允许注册的工具白名单（只放搜索类，按优先级排序）。
+  # 该列表之外的工具（browser / file_reader / code_sandbox 等）绝不会暴露给 Planner。
+  search_tools:
+    - "web_search"
+    - "arxiv_reader"
   # 是否启用动态计划调整（replan）
   enable_replan: true
   # 计划执行完成后是否自动进行完整性检查
@@ -149,25 +181,33 @@ compressor:
 
 memory:
   # M4: Shared Memory Store 配置
+  # false 时完全关闭共享持久记忆；任务依赖结果仍由运行时字典传递
+  enabled: true
   # SQLite 数据库文件路径
   db_path: "data/memory.db"
-  # 内存表中最大条目数，超过则触发淘汰
+  # 每个会话的活跃记忆硬上限，写事务内通过 LRU 保持；所有条目固定时拒绝新写入
   max_entries: 10000
-  # 去重相似度阈值：高于此值视为重复记忆，不重复写入
+  # 去重候选阈值：还需确认文本/结构化事实等价，未知改写保留
   similarity_threshold_dup: 0.92
-  # 冲突检测阈值：高于此值但内容矛盾时触发冲突消解
+  # 自由文本冲突候选阈值；结构化同一事实直接比较，平权争议保留双方
   similarity_threshold_conflict: 0.65
-  # 每写入多少条后执行一次自动淘汰（LRU）
+  # 每处理多少次写入执行周期维护；容量超限即时处理，不等待周期
   evict_interval: 100
   # 是否启用向量化索引（加速相似度检索）
   enable_vector_index: true
+  # 可选闲置过期时长（秒）；null 不因闲置过期，metadata.expires_at 可单独指定
+  ttl_seconds: null
+  # 每个会话的历史快照上限（含冲突、替换、压缩和淘汰），0 表示不保留历史
+  max_history_entries: 10000
 
 adversarial:
   # M5: Red-Blue Adversarial Loop 配置
   # 总开关：是否启用对抗降噪流程
   enabled: true
   # Red-Blue 对抗最大轮数
-  max_rounds: 5
+  max_rounds: 3
+  # 三类修复合计每轮最多选择 5 个问题；未处理项显式记为 budget_deferred
+  max_issues_per_round: 5
   # Blue Agent 输出质量分阈值，达到此分即可提前终止对抗
   score_threshold: 9.5
   # 相邻两轮评分差异阈值，低于此值视为收敛，提前终止
@@ -202,6 +242,10 @@ evolution:
   symbolic_learning_interval: 3
 
 tools:
+  # Explicit L3 backend alternatives. Fixed snapshots and mock mode ignore these.
+  fallback_backends:
+    web_search: []
+    arxiv_reader: []
   # 工具模块全局配置
   web_search:
     enabled: true

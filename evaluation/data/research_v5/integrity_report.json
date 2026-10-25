@@ -1,0 +1,21 @@
+{
+  "status": "offline_integrity_passed",
+  "cases": 24,
+  "domains": {
+    "retrieval": 4,
+    "agents": 4,
+    "evaluation": 4,
+    "efficiency": 4,
+    "security": 4,
+    "sustainability": 4
+  },
+  "primary_sources": 31,
+  "verified_source_spans": 98,
+  "unchanged_source_spans": 76,
+  "email_redacted_source_spans": 22,
+  "contact_redaction": "email-redaction-v1; length-preserving block mask; original offsets and page breaks retained",
+  "reference_points": 144,
+  "annotation_review": "pending_user_review; redaction-aware source equality does not establish semantic entailment",
+  "model_experiments": "not_run",
+  "dataset_sha256": "260ff257c5d60b313e4da8ffccb527b264246553e579df8886233833694c15dc"
+}

@@ -71,13 +71,13 @@ initial_plan_prompt_template: |
       },
       {
         "task_id": "task_4",
-        "task_type": "verify",
+        "task_type": "analyze",
         "description": "使用代码工具对各国投资占比进行归一化验算，确保百分比加总为100%",
         "dependencies": ["task_3"],
         "context_keys": ["task_3_output"],
         "timeout_seconds": 120,
         "priority": 4,
-        "expected_type": "verification",
+        "expected_type": "analytical",
         "search_hints": []
       }
     ]
@@ -85,13 +85,13 @@ initial_plan_prompt_template: |
 
   【字段说明】
   - task_id: 唯一标识，格式为 "task_数字"。
-  - task_type: 枚举值，必须为 "search"（信息检索）、"analyze"（分析综合）或 "verify"（验证计算）之一。
+  - task_type: 枚举值，必须为 "search"（信息检索）或 "analyze"（分析综合）之一。
   - description: 子任务的具体描述，50-200 字，明确输出预期。
   - dependencies: 列表，填入所依赖的 task_id 字符串。无依赖则为空列表 []。
   - context_keys: 列表，填入需要从上游任务获取的上下文键名，通常对应依赖任务的 task_id 加 "_output"。
   - timeout_seconds: 整数，默认 120。
   - priority: 整数，1 表示最高优先级，数字越大优先级越低。
-  - expected_type: 枚举值，"factual"（事实型）、"analytical"（分析型）或 "verification"（验证型）。
+  - expected_type: 枚举值，"factual"（事实型）或 "analytical"（分析型）。
   - search_hints: 列表，仅当 task_type 为 search 时填写推荐搜索关键词，否则为空列表 []。
 
   【Few-Shot 完整示例】
@@ -101,7 +101,7 @@ initial_plan_prompt_template: |
   分析过程：
   - 关键概念：LLM、医疗诊断、准确性、监管政策。
   - 维度拆解：应用现状（事实检索）、准确性争议（学术分析）、监管政策（政策检索）、综合评估（分析）。
-  - 依赖关系：task_3（综合评估）依赖 task_1 和 task_2；task_4（验证）依赖 task_3。task_1 与 task_2 可并行。
+  - 依赖关系：task_3（综合评估）依赖 task_1 和 task_2；task_4（交叉核对）依赖 task_3。task_1 与 task_2 可并行。
 
   输出 JSON：
   {
@@ -141,13 +141,13 @@ initial_plan_prompt_template: |
       },
       {
         "task_id": "task_4",
-        "task_type": "verify",
+        "task_type": "analyze",
         "description": "核对各来源中提到的LLM诊断准确率数据的一致性，标记异常值并评估统计显著性",
         "dependencies": ["task_3"],
         "context_keys": ["task_3_output"],
         "timeout_seconds": 120,
         "priority": 3,
-        "expected_type": "verification",
+        "expected_type": "analytical",
         "search_hints": []
       }
     ]

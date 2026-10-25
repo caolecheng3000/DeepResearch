@@ -1,0 +1,28 @@
+# Research-paper tasks v5. No model experiment has been run with this profile.
+model:
+  backend: deepseek
+  backend_mapping: {solver: deepseek, planner: deepseek, summarizer: deepseek, compressor: deepseek, judge: deepseek, red_agent: deepseek, blue_agent: deepseek}
+  backend_sampling:
+    deepseek: {temperature: 0.1, max_tokens: 8192, top_p: 1.0, thinking_mode: disabled}
+    modules:
+      judge: {temperature: 0.1, max_tokens: 8192, top_p: 1.0, thinking_mode: disabled}
+evaluation: {max_sample_concurrency: 1}
+orchestrator:
+  max_concurrent: 3
+  global_timeout_seconds: 1800
+  max_replan_rounds: 1
+  max_sub_questions: 6
+  researcher_max_turns: 8
+  report_min_chars: 1800
+planner: {search_calls: 2}
+compressor: {enable_multilevel: true, max_context_length: 24000, output_reserve_tokens: 4096}
+memory: {enabled: true, max_entries: 100, enable_vector_index: false}
+adversarial:
+  enabled: true
+  force: true
+  max_rounds: 3
+  max_issues_per_round: 5
+  score_threshold: 8.0
+  delta_threshold: 0.3
+evolution: {enabled: false}
+tools: {snapshot_path: evaluation/data/research_deepresearch_v5.json, snapshot_calculator: true}

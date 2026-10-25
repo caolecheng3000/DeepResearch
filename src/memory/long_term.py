@@ -4,12 +4,13 @@ Long-term Memory 模块：SQLite 持久化 + 结构化查询
 设计决策：
 1. SQLite 零运维、文件级持久化、ACID 事务
 2. embedding 以 JSON 文本存储，加载时反序列化
-3. 所有写操作通过 threading.Lock 保证线程安全
+3. 实例内用 RLock，跨实例复合写入通过 SQLite BEGIN IMMEDIATE 事务协调
 4. metadata 使用 JSON 字段，保持 schema 灵活性
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import sqlite3
@@ -72,151 +73,129 @@ class MemoryEntry:
 
 
 class LongTermMemory:
-    """
-    长期记忆 SQLite 封装。
-
-    提供 entries 表的 CRUD 及基础查询。
-    上层 SharedMemoryStore 负责向量相似度计算和高级语义操作。
-    """
+    """Session-scoped SQLite storage. Schema migration and writes are transactional."""
 
     def __init__(self, db_path: str = "memory.db") -> None:
-        """
-        初始化并建表。
-
-        Args:
-            db_path: SQLite 数据库文件路径
-        """
         self.db_path = db_path
         self._lock = threading.RLock()
-        # 自动创建父目录（SQLite 不会在目录不存在时自动创建）
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_tables()
-        self._migrate_add_session_id()
 
     def _connect(self) -> sqlite3.Connection:
-        """创建新连接（SQLite 连接不是线程安全的，每次操作新建连接）。"""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        from ..utils.execution import check_deadline, remaining
+        check_deadline()
+        budget = remaining()
+        conn = sqlite3.connect(self.db_path, timeout=30 if budget is None else min(30, budget))
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _ensure_tables(self) -> None:
-        """初始化表结构（如果不存在）。"""
+    @contextmanager
+    def transaction(self):
+        """Serialize read/check/write across store instances and processes."""
+        from ..utils.execution import check_deadline
         with self._lock:
             conn = self._connect()
             try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS entries (
-                        entry_id TEXT PRIMARY KEY,
-                        claim TEXT NOT NULL,
-                        source TEXT NOT NULL,
-                        confidence REAL NOT NULL,
-                        agent_id TEXT NOT NULL,
-                        timestamp REAL NOT NULL,
-                        evidence_type TEXT NOT NULL,
-                        embedding_json TEXT NOT NULL,
-                        topic TEXT NOT NULL,
-                        metadata_json TEXT NOT NULL,
-                        session_id TEXT NOT NULL DEFAULT ''
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_entries_topic ON entries(topic)
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_entries_agent ON entries(agent_id)
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_entries_timestamp ON entries(timestamp)
-                    """
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                check_deadline()
                 conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
 
-    def _migrate_add_session_id(self) -> None:
-        """为已存在的旧表添加 session_id 列（向后兼容）。"""
-        with self._lock:
-            conn = self._connect()
-            try:
-                cur = conn.execute("PRAGMA table_info(entries)")
-                columns = [row["name"] for row in cur.fetchall()]
+    @staticmethod
+    def _create_table(conn, name="entries"):
+        # name is internal, never supplied by a caller.
+        conn.execute(f"""CREATE TABLE {name} (
+            entry_id TEXT NOT NULL, claim TEXT NOT NULL, source TEXT NOT NULL,
+            confidence REAL NOT NULL, agent_id TEXT NOT NULL, timestamp REAL NOT NULL,
+            evidence_type TEXT NOT NULL, embedding_json TEXT NOT NULL,
+            topic TEXT NOT NULL, metadata_json TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '', PRIMARY KEY (session_id, entry_id)
+        )""")
+
+    def _ensure_tables(self):
+        with self.transaction() as conn:
+            info = conn.execute("PRAGMA table_info(entries)").fetchall()
+            if not info:
+                self._create_table(conn)
+            else:
+                columns = {row["name"] for row in info}
                 if "session_id" not in columns:
                     conn.execute("ALTER TABLE entries ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_session ON entries(session_id)")
-                    conn.commit()
-                    logger.info("[LongTermMemory] 已迁移：为 entries 表添加 session_id 列")
-            except Exception as e:
-                logger.warning(f"[LongTermMemory] session_id 迁移失败（可能已存在）: {e}")
-            finally:
-                conn.close()
+                    info = conn.execute("PRAGMA table_info(entries)").fetchall()
+                primary = [r["name"] for r in sorted(info, key=lambda r: r["pk"]) if r["pk"]]
+                if primary != ["session_id", "entry_id"]:
+                    self._create_table(conn, "entries_session_migration")
+                    names = ("entry_id,claim,source,confidence,agent_id,timestamp,"
+                             "evidence_type,embedding_json,topic,metadata_json,session_id")
+                    conn.execute(f"INSERT INTO entries_session_migration ({names}) SELECT {names} FROM entries")
+                    conn.execute("DROP TABLE entries")
+                    conn.execute("ALTER TABLE entries_session_migration RENAME TO entries")
+            for col in ("topic", "agent_id", "timestamp", "session_id"):
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_entries_{col} ON entries({col})")
+            # Side tables preserve the public MemoryEntry and legacy entries schema.
+            conn.execute("""CREATE TABLE IF NOT EXISTS memory_access (
+                session_id TEXT NOT NULL, entry_id TEXT NOT NULL,
+                last_access REAL NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_id, entry_id))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS memory_history (
+                history_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                entry_id TEXT NOT NULL, archived_at REAL NOT NULL,
+                reason TEXT NOT NULL, entry_json TEXT NOT NULL, details_json TEXT NOT NULL)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_memory_history_session
+                ON memory_history(session_id, archived_at)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS memory_maintenance (
+                session_id TEXT PRIMARY KEY, write_count INTEGER NOT NULL DEFAULT 0)""")
 
-    # ------------------------------------------------------------------
-    # Entries 操作
-    # ------------------------------------------------------------------
+    @staticmethod
+    def write_entry(conn, entry: MemoryEntry):
+        conn.execute("""INSERT INTO entries
+            (entry_id,claim,source,confidence,agent_id,timestamp,evidence_type,
+             embedding_json,topic,metadata_json,session_id)
+            VALUES (:entry_id,:claim,:source,:confidence,:agent_id,:timestamp,
+                    :evidence_type,:embedding_json,:topic,:metadata_json,:session_id)
+            ON CONFLICT(session_id, entry_id) DO UPDATE SET
+                claim=excluded.claim,source=excluded.source,confidence=excluded.confidence,
+                agent_id=excluded.agent_id,timestamp=excluded.timestamp,
+                evidence_type=excluded.evidence_type,embedding_json=excluded.embedding_json,
+                topic=excluded.topic,metadata_json=excluded.metadata_json
+        """, entry.to_dict())
 
     def insert_entry(self, entry: MemoryEntry) -> None:
-        """插入或替换 entry（REPLACE 语义）。"""
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO entries
-                    (entry_id, claim, source, confidence, agent_id, timestamp,
-                     evidence_type, embedding_json, topic, metadata_json, session_id)
-                    VALUES
-                    (:entry_id, :claim, :source, :confidence, :agent_id, :timestamp,
-                     :evidence_type, :embedding_json, :topic, :metadata_json, :session_id)
-                    """,
-                    entry.to_dict(),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        with self.transaction() as conn:
+            self.write_entry(conn, entry)
 
-    def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
-        """按 ID 查询单条 entry。"""
+    def get_entry(self, entry_id: str, session_id: str = "") -> Optional[MemoryEntry]:
         with self._lock:
             conn = self._connect()
             try:
-                cur = conn.execute(
-                    "SELECT * FROM entries WHERE entry_id = ?", (entry_id,)
-                )
-                row = cur.fetchone()
+                row = conn.execute("SELECT * FROM entries WHERE session_id=? AND entry_id=?",
+                                   (session_id, entry_id)).fetchone()
                 return MemoryEntry.from_row(row) if row else None
             finally:
                 conn.close()
 
     def get_all_entries(self, session_id: Optional[str] = None) -> list[MemoryEntry]:
-        """加载 entries。若指定 session_id，只加载该会话的数据。"""
+        """None is an explicit administrative all-session read; stores pass a scope."""
         with self._lock:
             conn = self._connect()
             try:
-                if session_id is not None:
-                    cur = conn.execute("SELECT * FROM entries WHERE session_id = ?", (session_id,))
-                else:
-                    cur = conn.execute("SELECT * FROM entries")
-                return [MemoryEntry.from_row(r) for r in cur.fetchall()]
+                rows = (conn.execute("SELECT * FROM entries") if session_id is None else
+                        conn.execute("SELECT * FROM entries WHERE session_id=?", (session_id,)))
+                return [MemoryEntry.from_row(r) for r in rows]
             finally:
                 conn.close()
 
     def count_entries(self, session_id: Optional[str] = None) -> int:
-        """返回 entries 数量。可指定 session_id 过滤。"""
         with self._lock:
             conn = self._connect()
             try:
-                if session_id is not None:
-                    cur = conn.execute("SELECT COUNT(*) FROM entries WHERE session_id = ?", (session_id,))
-                else:
-                    cur = conn.execute("SELECT COUNT(*) FROM entries")
-                return cur.fetchone()[0]
+                row = (conn.execute("SELECT COUNT(*) FROM entries") if session_id is None else
+                       conn.execute("SELECT COUNT(*) FROM entries WHERE session_id=?", (session_id,)))
+                return row.fetchone()[0]
             finally:
                 conn.close()
-

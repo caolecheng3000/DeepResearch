@@ -85,55 +85,13 @@ def run_single_system(
     bench: ResearchBench,
 ) -> dict[str, Any]:
     """跑单个系统配置，返回每道题的评分结果。"""
-    print(f"\n{'='*60}")
-    print(f"[消融] {system_name}: {desc}")
-    print(f"{'='*60}")
-
-    cfg = AblationStudy.override_config(config, overrides)
-    modules = initialize_modules(cfg)
-
-    per_question_scores: dict[str, float] = {}
-    details: list[dict[str, Any]] = []
-
-    for q in questions:
-        qid = q["id"]
-        query = q["query"]
-        print(f"  [{qid}] {query[:60]}...")
-
-        start = time.time()
-        try:
-            report = asyncio.run(run_research(query, cfg, modules))
-            elapsed = time.time() - start
-            eval_result = evaluate_with_rules(report, qid, bench)
-            composite = eval_result["composite_score"]
-            per_question_scores[qid] = composite
-            details.append({
-                "question_id": qid,
-                "query": query,
-                "composite_score": composite,
-                "metrics": eval_result["metrics"],
-                "elapsed_seconds": elapsed,
-            })
-            print(f"    → composite={composite:.3f}, time={elapsed:.1f}s")
-        except Exception as e:
-            print(f"    → FAILED: {e}")
-            per_question_scores[qid] = 0.0
-            details.append({
-                "question_id": qid,
-                "query": query,
-                "error": str(e),
-                "composite_score": 0.0,
-            })
-
-    scores = list(per_question_scores.values())
-    avg = sum(scores) / len(scores) if scores else 0.0
-    return {
-        "system_name": system_name,
-        "description": desc,
-        "average_composite_score": avg,
-        "per_question_scores": per_question_scores,
-        "details": details,
-    }
+    # Resolve the complete question annotations before using the shared runner.
+    annotated = [next((x for x in bench.questions if x["id"] == q["id"]), q) for q in questions]
+    result = AblationStudy.run_module_ablation(config, annotated, {system_name: (desc, overrides)})
+    system = result["systems"][0]
+    system["per_question_scores"] = {r["question_id"]: r["composite_score"] for r in system["details"]}
+    system["artifact_dir"] = result["artifact_dir"]
+    return system
 
 
 def compute_ablation_stats(

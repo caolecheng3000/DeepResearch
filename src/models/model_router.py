@@ -45,6 +45,7 @@ class ModelRouter:
     @staticmethod
     def create_backend(
         backend_name: str | None = None,
+        module_tag: str | None = None,
         **override_kwargs,
     ) -> VLLMPolicy:
         """创建指定名称的 LLM Backend（返回 VLLMPolicy 实例）。
@@ -52,6 +53,11 @@ class ModelRouter:
         Args:
             backend_name: 后端名称，对应 .env 中的前缀。
                           为 None 时使用 DEFAULT_LLM_BACKEND。
+            module_tag: 调用方模块标识（如 "planner" / "blue_agent"）。
+                        相同后端 + 相同采样参数 + 相同 module_tag 才共享实例；
+                        module_tag 不同则各自持有独立实例，避免跨模块状态污染
+                        （如 set_tools / max_tokens 临时改写相互泄漏）。
+                        为 None 时退化为仅按参数共享（向后兼容旧调用点）。
             **override_kwargs: 覆盖 .env 中任何参数（如 temperature, max_tokens）。
 
         Returns:
@@ -64,8 +70,8 @@ class ModelRouter:
 
         name = (backend_name or get_env("DEFAULT_LLM_BACKEND", "vllm")).lower().strip()
 
-        # 检查缓存
-        cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
+        # 检查缓存（module_tag 参与 key，实现模块级实例隔离）
+        cache_key = f"{name}:{module_tag or 'shared'}:{hash(tuple(sorted(override_kwargs.items())))}"
         if cache_key in _BACKEND_CACHE:
             return _BACKEND_CACHE[cache_key]
 

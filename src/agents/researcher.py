@@ -11,13 +11,18 @@
 """
 from __future__ import annotations
 
+from ..utils.execution import call_policy, bounded, check_deadline
+
 import asyncio
+from dataclasses import asdict
 import json
 from typing import Any
 
 from .base_agent import BaseAgent
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
-from ..utils.tracing import trace_agent
+from ..utils.tracing import trace_agent, trace_tool
+from ..utils.recovery import (ToolExecutor, ToolOutcome, Failure, RecoveryConfig,
+                              classify_error, public_message)
 
 
 __all__ = ["ResearcherAgent"]
@@ -46,268 +51,145 @@ class ResearcherAgent(BaseAgent):
         policy,
         tools: list | None = None,
         max_turns: int = 15,
+        recovery_config=None,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
+        self.recovery_config = RecoveryConfig.from_dict(recovery_config)
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
-        """执行 Researcher 任务。
-
-        流程:
-          1. 构建初始 system + user messages
-          2. 循环调用 policy，解析 tool_calls
-          3. 执行工具，将结果追加为 tool message
-          4. 直到无 tool_calls 或达到 max_turns
-        """
-        trajectory: list[dict] = []
-        total_tokens: int = 0
-
-        # 构建任务描述
-        task_desc = self._build_task_prompt(task, context)
-
-        # 查询可行性判断：如果任务明显无法通过网络搜索获得答案，直接基于已知信息分析
-        if self._is_non_searchable(task, context):
-            messages = [
-                {"role": "system", "content": self._system_prompt_direct_analysis()},
-                {"role": "user", "content": task_desc},
-            ]
-            try:
-                response = self.policy(messages)
-                content = response.get("content", "") or ""
-                content = self._clean_output(content)
-                return AgentResult(
-                    task_id=task.task_id,
-                    status=AgentStatus.SUCCESS,
-                    output=content,
-                    trajectory=[{"role": "assistant", "content": content}],
-                    token_usage=len(content) // 3,
-                    confidence=self._extract_confidence(content),
-                )
-            except Exception as e:
-                return AgentResult(
-                    task_id=task.task_id,
-                    status=AgentStatus.FAILED,
-                    output=f"Direct analysis failed: {e}",
-                    trajectory=[{"error": str(e)}],
-                    token_usage=0,
-                    confidence=0.0,
-                )
-
+        """L1–L3 stay inside this task; only Orchestrator may request L4 Replan."""
+        self._executor = ToolExecutor(self.tools, self.recovery_config)
+        self.partial_result = None
+        trajectory = []
+        total_tokens = 0
+        usable_evidence = 0
+        last_failure = None
+        direct = self._is_non_searchable(task, context)
         messages = [
-            {"role": "system", "content": self._system_prompt()},
-            {"role": "user", "content": task_desc},
+            {"role": "system", "content": self._system_prompt_direct_analysis() if direct else self._system_prompt()},
+            {"role": "user", "content": self._build_task_prompt(task, context)},
         ]
 
-        # 若 policy 支持 tool 设置，则注册可用工具
-        if hasattr(self.policy, "set_tools") and self.tools:
-            schemas = [t.get_openai_tool_schema() for t in self.tools]
-            self.policy.set_tools(schemas)
+        def finish(content, gaps=None):
+            # Inspect the original output before cleanup can erase a failure explanation.
+            gaps = list(gaps or [])
+            if not content.strip() or self._is_tool_failure_explanation(content) or content.lstrip().startswith("Error:"):
+                gaps.append("empty_or_error_output")
+            upstream = any(getattr(context.get(f"dep:{dep}"), "status", None) == AgentStatus.SUCCESS
+                           for dep in task.dependencies)
+            if self.tools and not direct and usable_evidence == 0 and not upstream:
+                gaps.append("no_usable_evidence")
+            requirements = context.get("task_acceptance", {}).get(task.task_id, {})
+            for term in requirements.get("required_terms", []):
+                if term not in content:
+                    gaps.append(f"missing_required_term:{term}")
+            if len(content.strip()) < requirements.get("min_chars", 1):
+                gaps.append("output_too_short")
+            passed = not gaps
+            if not content.strip() and usable_evidence:
+                recovered = [event["result"] for event in trajectory
+                             if event.get("role") == "tool" and event.get("recovery", {}).get("status") in ("success", "partial")]
+                content = "部分结果，任务尚未通过验收。缺口：" + ", ".join(gaps)
+                content += "\n" + json.dumps(recovered, ensure_ascii=False, default=str)[:6000]
+            cleaned = content.strip()  # Preserve limitations and partial evidence; do not hide failure text.
+            status = AgentStatus.SUCCESS if passed else (
+                AgentStatus.PARTIAL if cleaned and (usable_evidence or upstream) else AgentStatus.FAILED)
+            return AgentResult(
+                task_id=task.task_id, status=status, output=cleaned,
+                trajectory=trajectory, token_usage=total_tokens,
+                confidence=self._extract_confidence(cleaned) if passed else 0.0,
+                acceptance={"passed": passed, "gaps": list(dict.fromkeys(gaps)),
+                            "usable_tool_results": usable_evidence, "scope": "structural_and_evidence_availability_not_truth_verification"},
+                recovery={"level": 0 if passed else 4, "needs_replan": not passed,
+                          "last_error": asdict(last_failure) if last_failure else None,
+                          "tool_calls": self._executor.calls, "repairs": self._executor.repairs,
+                          "fallbacks": self._executor.fallbacks, "history": self._executor.history},
+            )
 
-        # 根据任务类型确定 fallback 工具
-        desc_lower = (task.description or "").lower()
-        academic_keywords = ["论文", "paper", "publication", "学术", "arxiv", "neurips", "icml", "iclr", "scholar", "citation", "文献"]
-        fallback_tool = "arxiv_reader" if any(kw in desc_lower for kw in academic_keywords) else "web_search"
-        
-        for turn in range(self.max_turns):
-            # Fallback: if last turn had no tool_calls, force a search instruction
-            if turn > 0 and messages and messages[-1].get("role") == "assistant":
-                last_tool_calls = messages[-1].get("tool_calls", [])
-                if not last_tool_calls:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"You did not use any tools. "
-                            f"You MUST call the '{fallback_tool}' tool now to search for information. "
-                            f"Do not write a summary without searching first."
-                        ),
-                    })
-
+        for turn in range(1 if direct else self.max_turns):
+            if hasattr(self.policy, "set_tools"):
+                self.policy.set_tools(None if direct else [self.tool_map[name].get_openai_tool_schema()
+                    for name in self._executor.available() if hasattr(self.tool_map[name], "get_openai_tool_schema")])
             try:
-                # 使用线程池执行同步 policy，避免阻塞 asyncio 事件循环
-                response = await asyncio.to_thread(self.policy, messages)
-            except RuntimeError as e:
-                # 上下文长度超限等致命错误
-                trajectory.append({"turn": turn, "error": str(e)})
-                return AgentResult(
-                    task_id=task.task_id,
-                    status=AgentStatus.FAILED,
-                    output=str(e),
-                    trajectory=trajectory,
-                    token_usage=total_tokens,
-                    confidence=0.0,
-                )
-
+                response = await call_policy(self.policy, messages)
+            except asyncio.TimeoutError:
+                raise
+            except Exception as exc:
+                last_failure = classify_error(exc, model=True)
+                trajectory.append({"turn": turn, "error": public_message(exc)})
+                return finish("", [last_failure.code])
             content = response.get("content", "") or ""
-            tool_calls = response.get("tool_calls", []) or []
-
-            trajectory.append({
-                "turn": turn,
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [dict(tc) for tc in tool_calls],
-            })
-
-            # 估算 token（简化：字符数 / 3）
-            total_tokens += len(json.dumps(messages, ensure_ascii=False)) // 3
-
-            # 无工具调用 → 任务完成
+            tool_calls = []
+            for index, tc in enumerate(response.get("tool_calls") or []):
+                function = dict(tc["function"])
+                if isinstance(function.get("arguments"), dict):
+                    function["arguments"] = json.dumps(function["arguments"], ensure_ascii=False)
+                tool_calls.append({**tc, "id": tc.get("id") or f"turn_{turn}_call_{index}", "function": function})
+            trajectory.append({"turn": turn, "role": "assistant", "content": content,
+                               "tool_calls": [dict(tc) for tc in tool_calls]})
+            total_tokens += len(json.dumps(messages, ensure_ascii=False, default=str)) // 3
             if not tool_calls:
-                # 清理输出中的工具失败/API 密钥信息
-                cleaned = self._clean_output(content)
-                # B方案：检测 LLM 回复是否包含明显的工具失败说明（使用清理后的内容）
-                if self._is_tool_failure_explanation(cleaned):
-                    return AgentResult(
-                        task_id=task.task_id,
-                        status=AgentStatus.FAILED,
-                        output=cleaned,
-                        trajectory=trajectory,
-                        token_usage=total_tokens,
-                        confidence=0.0,
-                    )
-                confidence = self._extract_confidence(cleaned)
-                return AgentResult(
-                    task_id=task.task_id,
-                    status=AgentStatus.SUCCESS,
-                    output=cleaned,
-                    trajectory=trajectory,
-                    token_usage=total_tokens,
-                    confidence=confidence,
-                )
-
-            # 执行工具调用
-            tool_results = []
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                tool_name = func.get("name", "")
-                try:
-                    args = json.loads(func.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = await self._execute_tool(tool_name, args)
-
-                # B方案：工具返回错误 → 将错误告知 LLM 让它尝试其他工具（不立即失败）
-                if isinstance(result, dict) and result.get("error"):
-                    error_msg = result["error"]
-                    trajectory.append({
-                        "turn": turn,
-                        "role": "tool",
-                        "tool_call_id": tc.get("id", ""),
-                        "name": tool_name,
-                        "error": error_msg,
-                    })
-                    # 将错误作为正常工具结果记录，让 LLM 看到并自行决定换工具
-                    tool_results.append({
-                        "tool_call_id": tc.get("id", ""),
-                        "name": tool_name,
-                        "result": result,
-                    })
-                    continue
-
-                tool_results.append({
-                    "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
-                    "result": result,
-                })
-                trajectory.append({
-                    "turn": turn,
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
-                    "result": result,
-                })
-
-            # 检测是否有工具报错 → 引导 LLM 尝试其他可用工具（如 arxiv_reader、browser）
-            tool_errors = [tr for tr in tool_results if isinstance(tr.get("result"), dict) and tr["result"].get("error")]
-            if tool_errors:
-                error_names = ", ".join(tr["name"] for tr in tool_errors)
-                # 列出仍然可用的替代工具
-                available_alternatives = []
-                for t_name in ["arxiv_reader", "browser", "calculator", "code_sandbox", "notepad", "web_search"]:
-                    if t_name in self.tool_map and t_name not in [tr["name"] for tr in tool_errors]:
-                        available_alternatives.append(t_name)
-                alt_list = ", ".join(f"'{t}'" for t in available_alternatives) if available_alternatives else "none available"
-
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"⚠️ CRITICAL: The following tool(s) FAILED: {error_names}. "
-                        f"These tools will NOT work no matter how many times you retry. "
-                        f"STOP calling them immediately.\n\n"
-                        f"ALTERNATIVE tools still available: {alt_list}.\n"
-                        f"MUST DO: Call one of the alternative tools NOW to complete your research. "
-                        f"For academic/paper topics, use 'arxiv_reader'. "
-                        f"For general web content, use 'browser' with a known URL. "
-                        f"If no alternative works, you MUST still write a summary based on what you know — "
-                        f"do NOT say 'unable to search' in your output."
-                    ),
-                })
-
-            # 检测搜索结果是否全为空（工具返回了但无有效内容）
-            all_empty = True
-            for tr in tool_results:
-                if tr["name"] == "web_search":
-                    res = tr["result"]
-                    if isinstance(res, dict) and res.get("results"):
-                        for r in res["results"]:
-                            if r.get("snippet", "").strip():
-                                all_empty = False
-                                break
-            
-            # 如果已搜索 2+ 轮或搜索结果全空，强制要求总结
-            search_count = sum(1 for t in trajectory if t.get("role") == "tool" and t.get("name") == "web_search")
-            force_summary = False
-            if search_count >= 2:
-                force_summary = True
-            if all_empty and tool_results:
-                force_summary = True
-
-            # 将 assistant message 和 tool results 追加到 messages
-            assistant_msg = {
-                "role": "assistant",
-                "content": content,
-            }
-            if tool_calls:
-                assistant_msg["tool_calls"] = [dict(tc) for tc in tool_calls]
-            # 保留 reasoning_content（DeepSeek 推理模型需要传回）
+                return finish(content)
+            # Preserve protocol ordering: assistant(call) -> ALL tool results -> feedback.
+            assistant = {"role": "assistant", "content": content, "tool_calls": [dict(tc) for tc in tool_calls]}
             if response.get("reasoning_content"):
-                assistant_msg["reasoning_content"] = response["reasoning_content"]
-            messages.append(assistant_msg)
-
-            for tr in tool_results:
-                msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
-                # 如果强制总结，给工具结果附加提示
-                if force_summary:
-                    if all_empty and tool_results:
-                        msg_content += (
-                            "\n\n[SYSTEM NOTICE] Some tools returned empty results, but you still have information "
-                            "from other tools and your own knowledge. Write a substantive summary NOW based on ALL "
-                            "available information (both tool results and context). Do NOT say 'unable to find' or "
-                            "'no results'. Extract every useful fact and insight from what you have. "
-                            "Do NOT call any more tools."
-                        )
+                assistant["reasoning_content"] = response["reasoning_content"]
+            messages.append(assistant)
+            feedback = []
+            terminal = None
+            for call_index, tc in enumerate(tool_calls):
+                func = tc.get("function") or {}
+                name = func.get("name", "")
+                call_id = tc.get("id") or f"turn_{turn}_call_{call_index}"
+                if terminal:
+                    outcome = ToolOutcome("error", failure=Failure(4, "BATCH_STOPPED", terminal, "task"), tool_name=name)
+                else:
+                    outcome = await self._execute_tool_outcome(name, func.get("arguments", "{}"), call_id)
+                if outcome.status in ("success", "partial") and name in (
+                        "web_search", "arxiv_reader", "browser", "file_reader", "calculator", "code_sandbox"):
+                    usable_evidence += 1
+                event = {"turn": turn, "role": "tool", "tool_call_id": call_id, "name": name,
+                         "result": outcome.data if outcome.status != "error" else {"error": asdict(outcome.failure)},
+                         "recovery": outcome.to_dict()}
+                if outcome.failure:
+                    last_failure = outcome.failure
+                    event["error"] = outcome.failure.message
+                    if outcome.failure.level == 1:
+                        if self._executor.repair_feedback():
+                            feedback.append(f"L1: {name}: {outcome.failure.message}. Correct the call arguments; do not repeat invalid input.")
+                        else:
+                            terminal = "argument_repair_budget_exhausted"
+                    elif outcome.failure.level == 4:
+                        terminal = outcome.failure.code
                     else:
-                        msg_content += (
-                            "\n\n[SYSTEM NOTICE] You have already searched enough. "
-                            "Write your final summary NOW. Do NOT call any more tools."
-                        )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tr["tool_call_id"],
-                    "content": msg_content,
-                })
+                        alternatives = self._recovery_alternatives(name)
+                        feedback.append(f"L3: {name}: {outcome.failure.message}. Equivalent capabilities available: {alternatives}. "
+                                        "Use only a relevant alternative or finish with explicit evidence gaps. Never invent evidence.")
+                elif outcome.status == "empty":
+                    feedback.append(f"{name} returned no matching content. Change the query or source; do not repeat the same empty request.")
+                trajectory.append(event)
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "content": json.dumps(outcome.to_dict(), ensure_ascii=False, default=str)})
+                if usable_evidence:
+                    self.partial_result = finish("", ["interrupted_before_completion"])
+            if terminal:
+                return finish("", [terminal])
+            if feedback:
+                messages.append({"role": "user", "content": "\n".join(feedback)})
+        return finish("", ["max_turns_exhausted"])
 
-        # 达到 max_turns
-        return AgentResult(
-            task_id=task.task_id,
-            status=AgentStatus.TIMEOUT,
-            output="Reached max_turns without final answer.",
-            trajectory=trajectory,
-            token_usage=total_tokens,
-            confidence=0.0,
-        )
+    def _recovery_alternatives(self, failed_name):
+        families = ({"web_search", "arxiv_reader", "browser", "file_reader"},
+                    {"calculator", "code_sandbox"}, {"notepad"})
+        family = next((group for group in families if failed_name in group), {failed_name})
+        return [name for name in self._executor.available() if name != failed_name and name in family]
+
+    @trace_tool(name="researcher.tool", tags=["tool"])
+    async def _execute_tool_outcome(self, tool_name, arguments, call_id=None):
+        return await self._executor.run(tool_name, arguments, call_id)
 
     def _system_prompt(self) -> str:
         return (
@@ -325,11 +207,11 @@ class ResearcherAgent(BaseAgent):
             "- notepad: Write/read intermediate notes to avoid forgetting findings during multi-step research.\n"
             "- file_reader: Read local files (.txt, .md, .pdf, .csv, .json, .docx).\n"
             "\nIMPORTANT RULES:\n"
-            "1. You MUST use a tool to find factual information. Do NOT answer from your own knowledge.\n"
-            "2. If one tool fails (returns an error), switch to a DIFFERENT tool immediately. NEVER retry a failed tool.\n"
-            "3. For academic/paper topics, PREFER arxiv_reader over web_search — it always works without API keys.\n"
-            "4. For any topic, arxiv_reader can find relevant academic papers. Use it as your primary fallback.\n"
-            "5. You may call tools AT MOST 3 times total. After that you MUST summarize.\n"
+            "1. Search tasks must collect evidence with registered tools. Analyze tasks may use successful upstream evidence directly. Do NOT invent evidence from your own knowledge.\n"
+            "2. The runtime retries temporary errors. Follow structured recovery feedback; correct invalid arguments or choose a relevant available alternative.\n"
+            "3. For academic topics, prefer arxiv_reader when registered and available. No tool is guaranteed to succeed.\n"
+            "4. Alternatives must match the missing capability: academic papers cannot replace current event evidence; browser requires a known URL.\n"
+            "5. Work within the runtime tool and turn budgets. State evidence gaps explicitly if recovery fails.\n"
             "6. After gathering information, provide a detailed, comprehensive summary in Chinese (中文).\n"
             "   The summary MUST be at least 500 Chinese characters long. Include:\n"
             "   - Key findings with specific details (numbers, names, dates)\n"
@@ -337,9 +219,9 @@ class ResearcherAgent(BaseAgent):
             "   - Contrasting viewpoints or limitations\n"
             "   - A confidence score (0-1)\n"
             "   ALL your output — summaries, analysis, tool queries — MUST be in Chinese.\n"
-            "7. NEVER output 'unable to search', 'API key invalid', or apologies. Always produce a substantive summary.\n"
+            "7. Never invent missing facts. Distinguish supported findings from unverified conclusions and missing evidence.\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
-            "9. If you have already performed 3 tool calls, do NOT call more — write the final summary now."
+            "9. Finish when the task has sufficient evidence; do not repeat empty queries."
         )
 
     def _system_prompt_direct_analysis(self) -> str:
@@ -461,7 +343,7 @@ class ResearcherAgent(BaseAgent):
             first_instruction,
             "2. Review the results.",
             f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
-            "   You may call tools AT MOST 3 times total. After the 3rd call, you MUST write the final summary.",
+            "   Respect runtime budgets. If evidence remains unavailable, state the gap explicitly.",
             "4. If search results are too short, you may use 'browser' to read the full article (counts as 1 tool call).",
             "5. If calculations are needed, use 'calculator' or 'code_sandbox' (counts as 1 tool call).",
             "6. Finally, provide a DETAILED summary in Chinese (中文) with at least 500 characters. Include specific findings, sources, and a confidence score (0-1).",
@@ -501,15 +383,14 @@ class ResearcherAgent(BaseAgent):
         # 字符串或其他
         return str(value)[:800]
 
+    @trace_tool(name="researcher.tool")
     async def _execute_tool(self, tool_name: str, args: dict) -> dict:
-        """调用具体工具实例。"""
-        tool = self.tool_map.get(tool_name)
-        if tool is None:
-            return {"error": f"Tool '{tool_name}' not found"}
-        try:
-            return await tool.execute(**args)
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+        """Compatibility entry point; regular loop consumes the full ToolOutcome."""
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            executor = self._executor = ToolExecutor(self.tools, self.recovery_config)
+        outcome = await executor.run(tool_name, args)
+        return outcome.data if not outcome.failure else {"error": asdict(outcome.failure)}
 
     def _is_tool_failure_explanation(self, content: str) -> bool:
         """检测 LLM 回复是否是工具失败的解释说明而非真实研究结果。

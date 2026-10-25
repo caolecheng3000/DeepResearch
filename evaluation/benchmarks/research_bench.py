@@ -488,6 +488,9 @@ class ResearchBench:
         bias_score = max(0.0, 1.0 - hallucination)
 
         metrics = {
+            # Canonical composite component: deterministic key coverage. Semantic
+            # coverage remains a diagnostic, not an uncalibrated random fallback.
+            "factual_accuracy": factual_str,
             "factual_accuracy_str": factual_str,
             "factual_accuracy_sem": factual_sem,
             "logical_consistency": logic,

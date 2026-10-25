@@ -21,6 +21,8 @@ from typing import Any
 
 import aiohttp
 
+from ..utils.recovery import http_error_payload
+
 from ..utils.env_config import get_env
 
 __all__ = ["WebSearchTool", "MockWebSearchTool", "BaseWebSearchTool"]
@@ -142,9 +144,8 @@ class WebSearchTool(BaseWebSearchTool):
       - BING_SEARCH_KEY / BING_SEARCH_ENDPOINT: Bing API 配置
     """
 
-    _session: aiohttp.ClientSession | None = None
-
     def __init__(self, backend: str | None = None, api_key: str | None = None, api_endpoint: str | None = None) -> None:
+        self._session = None
         self.backend = (backend or get_env("SEARCH_BACKEND", "serpapi")).lower().strip()
 
         # SerpAPI 配置
@@ -165,22 +166,21 @@ class WebSearchTool(BaseWebSearchTool):
 
     def _get_session(self) -> aiohttp.ClientSession:
         """获取复用的 ClientSession，避免每次搜索新建连接。"""
-        if WebSearchTool._session is None or WebSearchTool._session.closed:
-            WebSearchTool._session = aiohttp.ClientSession(
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
                 headers={"Accept-Encoding": "gzip, deflate"}
             )
-        return WebSearchTool._session
+        return self._session
 
-    @classmethod
-    async def close_session(cls) -> None:
-        """关闭类级别的共享 session。应在程序退出前调用。"""
-        if cls._session is not None and not cls._session.closed:
-            await cls._session.close()
-            cls._session = None
+    async def close_session(self) -> None:
+        """关闭当前工具实例的 session。应在程序退出前调用。"""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     def __del__(self):
         """析构时尝试关闭 session（同步环境回退）。"""
-        if WebSearchTool._session is not None and not WebSearchTool._session.closed:
+        if getattr(self, "_session", None) is not None and not self._session.closed:
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.close_session())
@@ -226,6 +226,8 @@ class WebSearchTool(BaseWebSearchTool):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
+                    if resp.status >= 400:
+                        return await http_error_payload(resp, query, self.backend)
                     data = await resp.json()
                     if resp.status != 200:
                         error_msg = data.get("error", f"HTTP {resp.status}")
@@ -283,6 +285,8 @@ class WebSearchTool(BaseWebSearchTool):
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
+                    if resp.status >= 400:
+                        return await http_error_payload(resp, query, self.backend)
                     data = await resp.json()
                     if resp.status != 200:
                         error_msg = data.get("message", f"HTTP {resp.status}")
@@ -354,6 +358,8 @@ class WebSearchTool(BaseWebSearchTool):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
+                if resp.status >= 400:
+                    return await http_error_payload(resp, query, self.backend)
                 data = await resp.json()
                 if resp.status != 200:
                     error_msg = data.get("message", f"HTTP {resp.status}")
@@ -497,6 +503,8 @@ class WebSearchTool(BaseWebSearchTool):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                if resp.status >= 400:
+                    return await http_error_payload(resp, query, self.backend)
                 data = await resp.json()
                 if resp.status != 200 or data.get("errCode"):
                     error_msg = data.get("errMsg", f"HTTP {resp.status}")

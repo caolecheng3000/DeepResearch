@@ -22,6 +22,8 @@ from typing import Any
 
 import aiohttp
 
+from ..utils.recovery import http_error_payload
+
 from ..utils.env_config import get_env
 
 __all__ = ["ArxivReaderTool"]
@@ -173,6 +175,8 @@ class ArxivReaderTool:
                 async with session.get(
                     self.arxiv_base_url, params=params, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
+                    if resp.status >= 400:
+                        return await http_error_payload(resp, query or paper_id, self.backend)
                     text = await resp.text()
         except Exception as e:
             return {
@@ -243,6 +247,8 @@ class ArxivReaderTool:
                 params = {"fields": "title,authors,year,abstract,url,citationCount"}
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status >= 400:
+                            return await http_error_payload(resp, query or paper_id, self.backend)
                         data = await resp.json()
                         if resp.status != 200:
                             return {
@@ -267,6 +273,8 @@ class ArxivReaderTool:
                 }
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status >= 400:
+                            return await http_error_payload(resp, query or paper_id, self.backend)
                         data = await resp.json()
                         if resp.status != 200:
                             return {
@@ -329,6 +337,8 @@ class ArxivReaderTool:
                 url = f"{self.openalex_base_url}/works/{paper_id}"
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status >= 400:
+                            return await http_error_payload(resp, query or paper_id, self.backend)
                         data = await resp.json()
                         if resp.status != 200:
                             return {
@@ -352,6 +362,8 @@ class ArxivReaderTool:
                 }
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status >= 400:
+                            return await http_error_payload(resp, query or paper_id, self.backend)
                         data = await resp.json()
                         if resp.status != 200:
                             return {

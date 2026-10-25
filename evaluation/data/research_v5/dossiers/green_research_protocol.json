@@ -1,0 +1,89 @@
+{
+  "id": "green_research_protocol",
+  "title": "如何让研究论文的成本报告可复核？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "为开展大模型研究的实验室制定成本与环境影响报告协议。综合Green AI、早期NLP能耗研究、BLOOM核算和Chinchilla，讨论最终成功运行之外的超参搜索、失败运行与数据处理，提出质量成本联合报告和缺失信息处理方法。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Green AI\n- Energy and Policy Considerations for Deep Learning in NLP\n- Estimating the Carbon Footprint of BLOOM, a 176B Parameter Language Model\n- Training Compute-Optimal Large Language Models\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "greenai",
+    "energy",
+    "bloom",
+    "chinchilla"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "报告目标",
+      "expected": "Green AI主张将效率与性能共同考虑，不能只披露最好模型的准确率。",
+      "source_ids": [
+        "greenai"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "搜索成本",
+      "expected": "模型开发与搜索可能有额外成本，最终训练一次不能代表所有研究计算量。",
+      "source_ids": [
+        "energy",
+        "bloom"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "资源定义",
+      "expected": "参数量、训练Token、计算量、时间与电耗不同，需要明确测量和估算来源。",
+      "source_ids": [
+        "chinchilla",
+        "energy"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "核算范围",
+      "expected": "区分最终模型、项目开发和生命周期范围，并避免重复计入同一能耗。",
+      "source_ids": [
+        "bloom"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "复核字段",
+      "expected": "建议披露配置、硬件、运行数、失败与取消、质量指标、测量工具和缺失项；缺记录不填成零。",
+      "source_ids": [
+        "greenai",
+        "energy"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "比较方法",
+      "expected": "在任务质量、数据和预算约束下比较成本前沿，不能用跨论文不一致口径排唯一绿色榜单。",
+      "source_ids": [
+        "greenai",
+        "chinchilla",
+        "bloom"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

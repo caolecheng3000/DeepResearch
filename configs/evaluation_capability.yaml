@@ -1,0 +1,28 @@
+# Budgeted, non-thinking evaluation profile; does not change normal model defaults.
+model:
+  backend: deepseek
+  backend_mapping: {solver: deepseek, planner: deepseek, summarizer: deepseek, compressor: deepseek, judge: deepseek, red_agent: deepseek, blue_agent: deepseek}
+  backend_sampling:
+    deepseek: {temperature: 0.1, max_tokens: 8192, top_p: 1.0, thinking_mode: disabled}
+    modules:
+      judge: {temperature: 0.1, max_tokens: 8192, top_p: 1.0, thinking_mode: disabled}
+evaluation: {max_sample_concurrency: 4}
+orchestrator:
+  max_concurrent: 3
+  global_timeout_seconds: 900
+  max_replan_rounds: 1
+  max_sub_questions: 4
+  researcher_max_turns: 6
+  report_min_chars: 200
+planner: {search_calls: 1}
+compressor: {enable_multilevel: true, max_context_length: 16000, output_reserve_tokens: 2048}
+memory: {enabled: true, max_entries: 100, enable_vector_index: false}
+adversarial:
+  enabled: true
+  force: true
+  max_rounds: 3
+  max_issues_per_round: 5
+  score_threshold: 8.0
+  delta_threshold: 0.3
+evolution: {enabled: false}
+tools: {snapshot_path: evaluation/data/research_capability_v3.json, snapshot_calculator: true}

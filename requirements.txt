@@ -42,7 +42,7 @@ pyyaml>=6.0
 python-dotenv>=1.0
 
 # LangSmith 追踪与可观测性（Agent 流程可视化，可选但强烈推荐）
-langsmith>=0.1.0
+langsmith>=0.3.13,<1
 
 # 文本向量化（M4 记忆嵌入 + M3 相关性过滤）
 sentence-transformers>=2.5

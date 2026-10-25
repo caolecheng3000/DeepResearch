@@ -6,7 +6,6 @@ Agent 生命周期管理 (AgentPool)
 """
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,11 +37,19 @@ class AgentPool:
         tools_factory=None,
         max_idle: int = 3,
         max_turns: int = 15,
+        summarizer_policy_factory=None,
+        report_min_chars: int = 5000,
+        recovery_config=None,
     ) -> None:
         self.policy_factory = policy_factory
         self.tools_factory = tools_factory
         self.max_idle = max(max_idle, 1)
         self.max_turns = max_turns
+        self.report_min_chars = report_min_chars
+        from ..utils.recovery import RecoveryConfig
+        self.recovery_config = RecoveryConfig.from_dict(recovery_config)
+        self.summarizer_policy_factory = summarizer_policy_factory or policy_factory
+        self._leased: dict[int, str] = {}
 
         # 类型 -> 空闲 Agent 列表
         self._idle: dict[str, list[BaseAgent]] = {}
@@ -57,12 +64,12 @@ class AgentPool:
     # 核心 API
     # ------------------------------------------------------------------
 
-    async def get_agent(self, task_type: "TaskType") -> BaseAgent:
+    async def get_agent(self, task_type: "TaskType | str") -> BaseAgent:
         """根据任务类型获取可用的 Agent 实例。
 
         优先从池中复用，无空闲则新建。
         """
-        type_key = task_type.value
+        type_key = task_type if isinstance(task_type, str) else task_type.value
 
         # 初始化该类型的计数器
         if type_key not in self._idle:
@@ -78,16 +85,24 @@ class AgentPool:
             if hasattr(agent, "policy") and getattr(agent.policy, "was_truncated", False):
                 self._degraded_count[type_key] += 1
                 continue  # 丢弃，尝试下一个
+            # New mutable policy and tool state for each task, even when reusing
+            # the lightweight Agent wrapper. Factories must return fresh objects.
+            agent.policy = self._new_policy(type_key)
+            agent.tools = self.tools_factory() if self.tools_factory else []
+            if hasattr(agent, "tool_map"):
+                agent.tool_map = {t.name: t for t in agent.tools}
             self._active_count[type_key] += 1
+            self._leased[id(agent)] = type_key
             return agent
 
         # 新建 Agent
         agent = self._create_agent(type_key)
         self._created_count[type_key] += 1
         self._active_count[type_key] += 1
+        self._leased[id(agent)] = type_key
         return agent
 
-    async def release_agent(self, agent: "BaseAgent") -> None:
+    async def release_agent(self, agent: "BaseAgent", *, reusable: bool = True) -> None:
         """释放 Agent 回对象池。
 
         若 Agent 状态异常（如 policy was_truncated），则丢弃不回收。
@@ -95,13 +110,19 @@ class AgentPool:
         if agent is None:
             return
 
-        # 推断类型（从 agent 名称或类名推断）
-        type_key = self._infer_type_key(agent)
+        # Actual lease ownership, independent of class name.
+        type_key = self._leased.pop(id(agent), None)
+        if type_key is None:
+            return  # Not leased from this pool, or already released.
 
         self._active_count[type_key] = max(0, self._active_count.get(type_key, 0) - 1)
 
+        # Close per-task HTTP sessions before discarding or retaining the wrapper.
+        from ..utils.recovery import close_tools
+        reusable = await close_tools(agent.tools) and reusable
+
         # 健康检查
-        if hasattr(agent, "policy") and getattr(agent.policy, "was_truncated", False):
+        if not reusable or getattr(agent.policy, "was_truncated", False):
             self._degraded_count[type_key] = self._degraded_count.get(type_key, 0) + 1
             return  # 不回收
 
@@ -128,7 +149,7 @@ class AgentPool:
 
     def _create_agent(self, type_key: str) -> "BaseAgent":
         """根据类型键创建对应的 Agent 实例。"""
-        policy = self.policy_factory()
+        policy = self._new_policy(type_key)
         tools = self.tools_factory() if self.tools_factory else []
 
         # 延迟导入避免循环依赖
@@ -137,21 +158,15 @@ class AgentPool:
         from .schemas import TaskType
 
         if type_key == TaskType.SEARCH.value:
-            return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns)
+            return ResearcherAgent(name=f"researcher_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns, recovery_config=self.recovery_config)
         elif type_key == TaskType.ANALYZE.value:
-            return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns)
+            return ResearcherAgent(name=f"analyzer_{type_key}", policy=policy, tools=tools, max_turns=self.max_turns, recovery_config=self.recovery_config)
         elif type_key == "synthesize":
-            return SummarizerAgent(name="summarizer", policy=policy, tools=tools)
+            return SummarizerAgent(name="summarizer", policy=policy, tools=tools, min_report_chars=self.report_min_chars)
         else:
             # 默认降级为 Researcher
-            return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, max_turns=self.max_turns)
+            return ResearcherAgent(name=f"researcher_default", policy=policy, tools=tools, max_turns=self.max_turns, recovery_config=self.recovery_config)
 
-    def _infer_type_key(self, agent: "BaseAgent") -> str:
-        """从 Agent 实例推断其类型键。"""
-        # 简单启发式：通过类名推断
-        cls_name = agent.__class__.__name__
-        if "Summarizer" in cls_name:
-            return "synthesize"
-        # ResearcherAgent 用于 search/analyze，统一归到 search
-        from .schemas import TaskType
-        return TaskType.SEARCH.value
+    def _new_policy(self, type_key):
+        factory = self.summarizer_policy_factory if type_key == "synthesize" else self.policy_factory
+        return factory()

@@ -330,7 +330,11 @@ class ResearchMetrics:
 }}"""
 
         try:
-            policy = ModelRouter.create_backend("deepseek")
+            # 显式传入采样参数：避免 VLLMPolicy 默认 max_tokens=1024
+            # 被推理模型的思维链耗尽，导致 content 为空、无法解析 Judge 输出
+            policy = ModelRouter.create_backend(
+                "deepseek", temperature=0.1, max_tokens=8192, top_p=1.0
+            )
             messages = [
                 {"role": "system", "content": "你是研究报告评审专家。必须输出合法 JSON，不要输出任何其他内容。"},
                 {"role": "user", "content": prompt},

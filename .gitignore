@@ -1,27 +1,58 @@
-# Environment & Secrets
+# Local credentials (publish templates only)
 .env
-.env.local
+.env.*
+!.env.template
+!.env.tools.template
+*.pem
+*.key
+credentials*.json
 
-# Python
+# Python, editable installs, and local environments
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
-dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
 build/
+dist/
 
-# Data
-data/*.db
-data/*.sqlite
+# Research state and generated experiments; preserve locally
+/data/*
+/outputs/*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
 
-# Outputs
-outputs/reports/*.md
-outputs/*.log
+# Downloaded third-party archives; restore explicitly when auditing sources
+/evaluation/data/external/*
+!/evaluation/data/external/README.md
+/evaluation/data/research_v5/sources/*
+!/evaluation/data/research_v5/sources/README.md
 
-# IDE
-.vscode/
+# Generated Word exports; Markdown is the maintained source
+/docs/*.docx
+
+# Editor and operating-system state
 .idea/
-
-# OS
+.vscode/
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+
+# Private notes and generated documentation stay local
+/docs/
+/data/
+/outputs/
+/PUBLIC_SNAPSHOT.json
+/scripts/build_interview_docs.py

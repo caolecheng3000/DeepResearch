@@ -1,0 +1,23 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.pdf binary
+*.docx binary
+*.parquet binary
+
+# These rules also protect future git archive exports of a cleaned commit.
+.env export-ignore
+.env.local export-ignore
+__pycache__ export-ignore
+*.pyc export-ignore
+*.egg-info export-ignore
+/data export-ignore
+/outputs export-ignore
+/dist export-ignore
+/build export-ignore
+/evaluation/data/external export-ignore
+/evaluation/data/research_v5/sources export-ignore

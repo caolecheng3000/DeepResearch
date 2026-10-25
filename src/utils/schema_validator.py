@@ -9,6 +9,7 @@ Schema 校验与 LLM 输出重试模块
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -175,14 +176,15 @@ def validate_planner_output(data: dict) -> ValidationResult:
         ))
         return ValidationResult(valid=False, errors=errors)
 
-    if len(sub_tasks) < 2:
+    if not sub_tasks:
         errors.append(SchemaError(
             field="sub_tasks", error_type=ErrorType.OUT_OF_RANGE,
-            expected="length >= 2 (at least 2 sub-tasks)", got=f"length={len(sub_tasks)}"
+            expected="at least one sub-task", got=f"length={len(sub_tasks)}"
         ))
 
     valid_task_types = {"search", "analyze"}
     task_ids: set[str] = set()
+    task_type_map: dict[str, str] = {}
     for i, st in enumerate(sub_tasks):
         if not isinstance(st, dict):
             errors.append(SchemaError(
@@ -198,14 +200,19 @@ def validate_planner_output(data: dict) -> ValidationResult:
                 expected="non-empty string", got=str(tid)
             ))
         else:
+            if tid in task_ids:
+                errors.append(SchemaError(f"sub_tasks[{i}].task_id", ErrorType.INVALID_TYPE, "unique task_id", tid))
             task_ids.add(tid)
 
         tt = st.get("task_type", "")
-        if tt not in valid_task_types:
+        if not isinstance(tt, str) or tt not in valid_task_types:
             errors.append(SchemaError(
                 field=f"sub_tasks[{i}].task_type", error_type=ErrorType.INVALID_ENUM,
                 expected="search|analyze", got=str(tt)
             ))
+        # 收集 task_type 映射（用于后续依赖方向校验）
+        if isinstance(tid, str) and tid:
+            task_type_map[tid] = tt
 
         desc = st.get("description", "")
         if not desc or not isinstance(desc, str) or len(desc.strip()) < 5:
@@ -214,8 +221,19 @@ def validate_planner_output(data: dict) -> ValidationResult:
                 expected="non-empty string (min 5 chars)", got=str(desc)[:50]
             ))
 
+        timeout = st.get("timeout_seconds", 300)
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            errors.append(SchemaError(f"sub_tasks[{i}].timeout_seconds", ErrorType.OUT_OF_RANGE, "finite positive number", str(timeout)))
+        if type(st.get("priority", 1)) is not int:
+            errors.append(SchemaError(f"sub_tasks[{i}].priority", ErrorType.INVALID_TYPE, "integer", str(st.get("priority"))))
+        for field_name in ("context_keys", "search_hints"):
+            values = st.get(field_name, [])
+            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                errors.append(SchemaError(f"sub_tasks[{i}].{field_name}", ErrorType.INVALID_TYPE, "list of strings", str(values)))
+        if not isinstance(st.get("expected_type", "factual"), str):
+            errors.append(SchemaError(f"sub_tasks[{i}].expected_type", ErrorType.INVALID_TYPE, "string", str(st.get("expected_type"))))
         deps = st.get("dependencies", [])
-        if not isinstance(deps, list):
+        if not isinstance(deps, list) or any(not isinstance(d, str) for d in deps):
             errors.append(SchemaError(
                 field=f"sub_tasks[{i}].dependencies", error_type=ErrorType.INVALID_TYPE,
                 expected="list", got=str(type(deps).__name__)
@@ -225,13 +243,57 @@ def validate_planner_output(data: dict) -> ValidationResult:
     for i, st in enumerate(sub_tasks):
         if not isinstance(st, dict):
             continue
-        for dep in st.get("dependencies", []):
+        deps = st.get("dependencies", [])
+        if not isinstance(deps, list) or any(not isinstance(d, str) for d in deps):
+            continue
+        for dep in deps:
             if dep not in task_ids:
                 errors.append(SchemaError(
                     field=f"sub_tasks[{i}].dependencies", error_type=ErrorType.OUT_OF_RANGE,
                     expected=f"one of {sorted(task_ids)}", got=f"'{dep}' (not found in task_ids)"
                 ))
 
+    # 方案1: 依赖方向约束 —— search 不能依赖 analyze（信息流应为 search → analyze）
+    # 方案3: 依赖数量约束 —— analyze 应有依赖（存在 search 任务时）
+    has_search = "search" in task_type_map.values()
+    for i, st in enumerate(sub_tasks):
+        if not isinstance(st, dict):
+            continue
+        tt = st.get("task_type", "")
+        deps = st.get("dependencies", [])
+        if not isinstance(deps, list) or any(not isinstance(d, str) for d in deps):
+            continue
+
+        # 方案1: search 依赖 analyze → 方向错误
+        if tt == "search":
+            for dep in deps:
+                if task_type_map.get(dep) == "analyze":
+                    errors.append(SchemaError(
+                        field=f"sub_tasks[{i}].dependencies",
+                        error_type=ErrorType.INVALID_ENUM,
+                        expected="search 不能依赖 analyze（信息流应为 search → analyze）",
+                        got=f"依赖了 analyze 类型任务 '{dep}'"
+                    ))
+
+        # 方案3: analyze 无依赖（且存在 search 任务）→ 退化成 search
+        if tt == "analyze" and has_search and not deps:
+            errors.append(SchemaError(
+                field=f"sub_tasks[{i}].dependencies",
+                error_type=ErrorType.MISSING_FIELD,
+                expected="analyze 任务应至少依赖一个 search 任务",
+                got="空列表（analyze 无依赖会退化成 search）"
+            ))
+
+    if not errors:
+        graph = {st["task_id"]: set(st.get("dependencies", [])) for st in sub_tasks}
+        completed = set()
+        while graph:
+            ready = {key for key, deps in graph.items() if deps <= completed}
+            if not ready:
+                errors.append(SchemaError("sub_tasks.dependencies", ErrorType.INVALID_TYPE, "acyclic graph", "cycle detected"))
+                break
+            completed.update(ready)
+            graph = {key: deps for key, deps in graph.items() if key not in ready}
     return ValidationResult(valid=len(errors) == 0, errors=errors)
 
 
@@ -258,19 +320,25 @@ async def retry_with_schema_feedback(
         校验通过的解析后 dict，或全部失败时返回 None
     """
     import json
+    from .recovery import RecoveryError, current_recovery
 
     for attempt in range(max_retries + 1):
+        state = current_recovery()
+        if attempt and state is not None and not state.action():
+            return None
         try:
             resp = await policy_call(messages)
-            raw = (resp.content or resp.get("content", "")) if isinstance(resp, dict) else str(resp)
+            raw = resp.get("content", "") if isinstance(resp, dict) else getattr(resp, "content", "")
+            raw = raw or ""
+        except TimeoutError:
+            raise
+        except RecoveryError:
+            # Transport retries belong exclusively to call_policy.
+            return None
         except Exception as e:
+            if "[LLM_AUTH_OR_QUOTA_ERROR]" in str(e):
+                raise
             logger.warning(f"[SchemaValidator] LLM call failed (attempt {attempt+1}): {e}")
-            if attempt < max_retries:
-                messages.append({
-                    "role": "user",
-                    "content": f"调用失败: {e}。请重试。"
-                })
-                continue
             return None
 
         # 尝试解析 JSON
@@ -296,7 +364,7 @@ async def retry_with_schema_feedback(
                     except json.JSONDecodeError:
                         pass
 
-        if data is None:
+        if not isinstance(data, dict):
             if attempt < max_retries:
                 messages.append({
                     "role": "user",

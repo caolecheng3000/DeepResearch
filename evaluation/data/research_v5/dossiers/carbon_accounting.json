@@ -1,0 +1,89 @@
+{
+  "id": "carbon_accounting",
+  "title": "为什么模型训练碳排放估计会差很多？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "比较NLP训练能耗研究、Carbon Emissions and Large Neural Network Training与BLOOM碳足迹报告。解释硬件、运行时长、电力碳强度、数据中心开销和生命周期边界如何改变估计。给出统一核算表与不可直接比较项，不凭单个数值给模型贴环保排名。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Energy and Policy Considerations for Deep Learning in NLP\n- Carbon Emissions and Large Neural Network Training\n- Estimating the Carbon Footprint of BLOOM, a 176B Parameter Language Model\n- Green AI\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "energy",
+    "carbon",
+    "bloom",
+    "greenai"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "能耗与排放",
+      "expected": "能耗与碳排放不同，排放还取决于电力碳强度，不能仅凭训练时长或参数量排名。",
+      "source_ids": [
+        "energy",
+        "carbon"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "系统因素",
+      "expected": "硬件、利用率、数据中心效率和运行地区等因素影响核算，比较需声明设定。",
+      "source_ids": [
+        "carbon",
+        "energy"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "生命周期",
+      "expected": "BLOOM报告区分不同核算边界并讨论设备等生命周期贡献，训练动态电耗不是完整生命周期。",
+      "source_ids": [
+        "bloom"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "范围一致",
+      "expected": "需要分开最终训练、开发搜索、空闲或基础设施和制造等边界，不能把范围不同数字直接比较。",
+      "source_ids": [
+        "energy",
+        "bloom",
+        "carbon"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "统一表格",
+      "expected": "建议列硬件数量类型、时长、能耗来源、PUE或是否已计入、电力因子、边界与不确定性；不要求虚构缺失数据。",
+      "source_ids": [
+        "carbon",
+        "bloom"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "质量联报",
+      "expected": "按同任务质量或效用报告成本，Green AI支持把效率作为评价维度而非只追求单个准确率。",
+      "source_ids": [
+        "greenai"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

@@ -1,0 +1,87 @@
+{
+  "id": "finetuning_budget",
+  "title": "单卡领域适配该选LoRA还是QLoRA？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "为有单卡显存约束的领域研究助手比较LoRA与QLoRA。解释训练哪些参数、基座如何表示、主要内存开销及与全量微调的区别；分析论文结果的模型与任务条件，给出可复现选型实验。不要承诺任意模型在任意单卡上都能训练，也不要把微调等同于事实更新。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- LoRA: Low-Rank Adaptation of Large Language Models\n- QLoRA: Efficient Finetuning of Quantized LLMs\n- Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "lora",
+    "qlora",
+    "rag"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "LoRA机制",
+      "expected": "LoRA冻结预训练权重并训练低秩更新矩阵，减少可训练参数，不等于自动量化整个基座。",
+      "source_ids": [
+        "lora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "QLoRA机制",
+      "expected": "QLoRA通过冻结的量化基座反传到低秩适配器，提出NF4、双重量化和分页优化器等内存措施。",
+      "source_ids": [
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "内存构成",
+      "expected": "显存还受基座、激活、序列长度、批量和优化器状态影响，不能只用可训练参数比例预测峰值。",
+      "source_ids": [
+        "lora",
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "实验条件",
+      "expected": "论文中的质量与内存结果绑定具体模型、数据和训练设置，不能推成无条件等价或任意单卡保证。",
+      "source_ids": [
+        "lora",
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "知识更新",
+      "expected": "任务适配与带来源的知识更新不同，频繁更新的文献事实可以考虑检索方案，而非声称微调提供可靠引用。",
+      "source_ids": [
+        "rag",
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "验证方案",
+      "expected": "同数据与底座下控制训练预算，比较任务质量、峰值显存、吞吐及稳定性，明确无法运行的基线，允许按约束作不同选择。",
+      "source_ids": [
+        "lora",
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

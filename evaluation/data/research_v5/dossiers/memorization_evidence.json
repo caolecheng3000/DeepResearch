@@ -1,0 +1,86 @@
+{
+  "id": "memorization_evidence",
+  "title": "如何研究模型记忆与数据泄露，而不夸大结论？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "比较成员推断和训练数据提取研究中的攻击目标与证据，结合差分隐私给出研究方案。讨论训练记忆、正常泛化、公开重复文本与私密记录泄漏的区分，设计可复核的数据划分与攻击评估，并写出结论边界。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Extracting Training Data from Large Language Models\n- Membership Inference Attacks against Machine Learning Models\n- Deep Learning with Differential Privacy\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "extraction",
+    "membership",
+    "dp"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "攻击目标",
+      "expected": "成员推断识别训练成员，数据提取尝试恢复内容，不能把两个成功率视作同一指标。",
+      "source_ids": [
+        "membership",
+        "extraction"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "实证范围",
+      "expected": "提取论文证明特定模型与攻击设定下的记忆风险，不能外推所有模型或将未发现泄漏解释为安全。",
+      "source_ids": [
+        "extraction"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "证据核对",
+      "expected": "设计应核对提取内容与训练来源的关系，并区分公共重复文本、私密数据及普通相似生成。",
+      "source_ids": [
+        "extraction"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "数据隔离",
+      "expected": "攻击开发、阈值选择和测试分离，说明攻击者是否知道候选记录及能访问何种模型输出。",
+      "source_ids": [
+        "membership"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "防御比较",
+      "expected": "DP需要隐私预算与效用报告，不能只报告攻击准确率下降而省略任务效用。",
+      "source_ids": [
+        "dp",
+        "membership"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "研究伦理",
+      "expected": "提出使用授权、合成敏感标记或可公开审计数据的安全验证方案，不要求实际提取无授权私密内容。",
+      "source_ids": [
+        "extraction",
+        "dp"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

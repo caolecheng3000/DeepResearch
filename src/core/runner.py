@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,13 @@ def load_config(config_path: str | None = None) -> dict:
 def _create_tools_factory(config: dict):
     """创建工具工厂函数，返回 Agent 可用的工具列表。"""
     tools_cfg = config.get("tools", {})
+    if tools_cfg.get("snapshot_path"):
+        from src.tools.snapshot import SnapshotSearchTool, SnapshotBrowserTool
+        fixed_tools = [SnapshotSearchTool(tools_cfg["snapshot_path"]), SnapshotBrowserTool(tools_cfg["snapshot_path"])]
+        if tools_cfg.get("snapshot_calculator", False):
+            from src.tools.calculator import CalculatorTool
+            fixed_tools.append(CalculatorTool())
+        return fixed_tools
     mock_mode = tools_cfg.get("web_search", {}).get("mock_mode", True)
 
     from src.tools import (
@@ -116,6 +124,19 @@ def _create_tools_factory(config: dict):
 
     # 7. notepad
     tools["notepad"] = NotepadTool()
+
+    # L3: only explicitly configured real backends are eligible; never enable mock
+    # or live network fallback for fixed-snapshot evaluations.
+    fallbacks = tools_cfg.get("fallback_backends", {})
+    for name, allowed in (("web_search", {"serpapi", "bing", "bocha", "metaso"}),
+                          ("arxiv_reader", {"arxiv", "semantic_scholar", "openalex"})):
+        backends = fallbacks.get(name, [])
+        if not isinstance(backends, list) or any(backend not in allowed for backend in backends):
+            raise ValueError(f"tools.fallback_backends.{name} must be a list from {sorted(allowed)}")
+        if not mock_mode:
+            constructor = WebSearchTool if name == "web_search" else ArxivReaderTool
+            tools[name].recovery_fallbacks = [constructor(backend=backend)
+                for backend in dict.fromkeys(backends) if backend != tools[name].backend]
 
     # 返回列表形式（AgentPool 和 Agent 构造函数需要 list）
     return list(tools.values())
@@ -161,30 +182,58 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         kwargs.update(module_overrides)
         return kwargs
 
-    # 默认后端（所有模块共用）
+    # 默认后端模板；各模块与 Worker 使用独立 policy 副本
     default_kwargs = _get_sampling_kwargs("default", default_backend)
-    default_policy = ModelRouter.create_backend(default_backend, **default_kwargs)
+    default_policy = ModelRouter.create_backend(default_backend, **default_kwargs).clone()
     modules["default_policy"] = default_policy
     logger.info(f"[LLM] 默认后端已加载: {default_backend} ({default_kwargs})")
 
     # 多后端分工：不同模块用不同后端 + 不同采样参数
+    # module_tag 传入模块名，确保每个模块持有独立 policy 实例，
+    # 避免 set_tools / max_tokens 等运行时状态跨模块泄漏
     for module_name, backend_name in backend_mapping.items():
         kwargs = _get_sampling_kwargs(module_name, backend_name)
-        modules[f"{module_name}_policy"] = ModelRouter.create_backend(backend_name, **kwargs)
+        modules[f"{module_name}_policy"] = ModelRouter.create_backend(
+            backend_name, module_tag=module_name, **kwargs
+        ).clone()
         logger.info(f"[LLM] {module_name} → 后端={backend_name}, 采样={kwargs}")
 
-    # 若未配置分工，所有模块回退到 default_policy
+    # Even when no backend mapping is configured, roles do not share mutable policies.
+    for role in ("solver", "planner", "summarizer", "compressor", "red_agent", "blue_agent"):
+        modules.setdefault(f"{role}_policy", default_policy.clone())
+
+    # 若未配置分工，模块使用默认配置的独立 policy 副本。
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Tools（真实工具或 Mock 工具）
+    # 必须在 Planner 之前创建：Planner 的「规划前侦察」阶段需要白名单内的搜索工具
+    # ------------------------------------------------------------------
+    tools_list = _create_tools_factory(config)
+    modules["tools"] = tools_list
+    logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
+
+    # ------------------------------------------------------------------
     # M2: Adaptive Planner（Orchestrator 依赖 Planner，先初始化）
+    # ------------------------------------------------------------------
     from src.planner.planner import Planner
     from src.planner.budget_tracker import BudgetTracker
 
     planner_policy = modules.get("planner_policy", default_policy)
+    planner_cfg = config.get("planner", {})
     budget_tracker = BudgetTracker()
-    planner = Planner(policy=planner_policy, budget_tracker=budget_tracker)
+    planner = Planner(
+        policy=planner_policy,
+        budget_tracker=budget_tracker,
+        tools=tools_list,
+        search_calls=planner_cfg.get("search_calls", 1),
+        search_tools=planner_cfg.get("search_tools"),
+        max_sub_tasks=config.get("orchestrator", {}).get("max_sub_questions", 10),
+    )
     modules["planner"] = planner
-    logger.info("[M2] Planner 模块已初始化")
+    logger.info(
+        f"[M2] Planner 模块已初始化（规划前侦察搜索次数={planner.search_calls}）"
+    )
 
     # M3: Context Compressor
     from src.compressor.compressor import ContextCompressor
@@ -196,6 +245,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         budget=compressor_cfg.get("max_context_length", 16000),
         output_reserve=compressor_cfg.get("output_reserve_tokens", 2048),
     )
+    if not compressor_cfg.get("enable_multilevel", True):
+        compressor = None
     modules["compressor"] = compressor
     logger.info("[M3] Compressor 模块已初始化")
 
@@ -203,17 +254,22 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     from src.memory.memory_store import SharedMemoryStore
 
     memory_cfg = config.get("memory", {})
-    memory_store = SharedMemoryStore(
-        db_path=memory_cfg.get("db_path", "data/memory.db"),
-        session_id=session_id,
-    )
+    memory_store = None
+    if memory_cfg.get("enabled", True):
+        memory_store = SharedMemoryStore(
+            db_path=memory_cfg.get("db_path", "data/memory.db"),
+            session_id=session_id,
+            max_entries=memory_cfg.get("max_entries", 10000),
+            similarity_threshold_dup=memory_cfg.get("similarity_threshold_dup", 0.92),
+            similarity_threshold_conflict=memory_cfg.get("similarity_threshold_conflict", 0.65),
+            evict_interval=memory_cfg.get("evict_interval", 100),
+            enable_vector_index=memory_cfg.get("enable_vector_index", True),
+            ttl_seconds=memory_cfg.get("ttl_seconds"),
+            max_history_entries=memory_cfg.get("max_history_entries", 10000),
+        )
     modules["memory_store"] = memory_store
-    logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id})")
-
-    # Tools（真实工具或 Mock 工具）
-    tools_list = _create_tools_factory(config)
-    modules["tools"] = tools_list
-    logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
+    modules["session_id"] = memory_store.session_id if memory_store is not None else (session_id or uuid.uuid4().hex)
+    logger.info("[M4] Memory Store enabled=%s", memory_store is not None)
 
     # M5: Red-Blue Adversarial Loop（先创建，再注入 Orchestrator）
     from src.adversarial.loop import AdversarialLoop
@@ -225,7 +281,8 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     adversarial_cfg = config.get("adversarial", {})
 
     red_agent = RedAgent(policy=red_policy)
-    blue_agent = BlueAgent(policy=blue_policy, tools=tools_list)
+    blue_agent = BlueAgent(policy=blue_policy, tools=tools_list,
+        max_issues_per_round=adversarial_cfg.get("max_issues_per_round"))
     adversarial_loop = AdversarialLoop(
         red_agent=red_agent,
         blue_agent=blue_agent,
@@ -245,10 +302,13 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     researcher_max_turns = orchestrator_cfg.get("researcher_max_turns", 15)
 
     agent_pool = AgentPool(
-        policy_factory=lambda: modules.get("solver_policy", default_policy),
-        tools_factory=lambda: list(modules["tools"]),
+        policy_factory=lambda: modules.get("solver_policy", default_policy).clone(),
+        summarizer_policy_factory=lambda: modules.get("summarizer_policy", default_policy).clone(),
+        tools_factory=lambda: _create_tools_factory(config),
         max_idle=3,
         max_turns=researcher_max_turns,
+        report_min_chars=orchestrator_cfg.get("report_min_chars", 5000),
+        recovery_config=config.get("recovery"),
     )
     modules["agent_pool"] = agent_pool
 
@@ -260,6 +320,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         adversarial_loop=adversarial_loop,
         memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
+        force_adversarial=config.get("adversarial", {}).get("force", False),
     )
     modules["orchestrator"] = orchestrator
     logger.info("[M1] Orchestrator 模块已初始化")
@@ -276,7 +337,34 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
-async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str:
+async def run_research(query: str, config: dict, modules: dict[str, Any],
+                       *, metadata: dict | None = None) -> str:
+    """Compatible text API; structured telemetry is retained in modules['last_run']."""
+    from src.utils.tracing import research_trace, config_fingerprint, record_event
+    attrs = {"config_hash": config_fingerprint(config),
+             "backend": config.get("model", {}).get("backend", "deepseek"),
+             "tool_mode": "snapshot" if config.get("tools", {}).get("snapshot_path") else (
+                 "mock" if config.get("tools", {}).get("web_search", {}).get("mock_mode", True) else "live"),
+             "adversarial_enabled": config.get("adversarial", {}).get("enabled", True),
+             **(metadata or {})}
+    modules.pop("last_report", None)
+    recorder = None
+    try:
+        with research_trace(attrs) as recorder:
+            text = await _run_research(query, config, modules)
+            report = modules.get("last_report")
+            recorder.status = getattr(report, "status", "success")
+            record_event("research_result", {"status": recorder.status,
+                         "adversarial_rounds": getattr(report, "adversarial_rounds", 0),
+                         "num_replan": getattr(report, "num_replan", 0),
+                         "recovery": getattr(report, "recovery", {})})
+            return text
+    finally:
+        if recorder:
+            modules["last_run"] = recorder.snapshot()
+
+
+async def _run_research(query: str, config: dict, modules: dict[str, Any]) -> str:
     """
     执行完整的研究流程。
 
@@ -317,7 +405,13 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         enable_evolution=config.get("evolution", {}).get("enabled", False),
     )
 
-    report = await orchestrator.run(query, config=run_cfg)
+    try:
+        report = await orchestrator.run(query, config=run_cfg)
+        modules["last_report"] = report
+    finally:
+        # These are this module bundle's tools, never another run's global session.
+        from ..utils.recovery import close_tools
+        await close_tools(modules["tools"])
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
         f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"
@@ -329,9 +423,6 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
     else:
         logger.info("[Evolution] 进化优化已跳过")
 
-    # 关闭 WebSearchTool 连接池
-    from src.tools.web_search import WebSearchTool
-    await WebSearchTool.close_session()
 
     elapsed = time.time() - start_time
     logger.info(f"研究完成，耗时: {elapsed:.2f} 秒")

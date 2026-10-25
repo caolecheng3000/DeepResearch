@@ -41,7 +41,18 @@ def run_baseline(query: str, config: dict) -> dict:
     """用默认后端直接调用 LLM，返回报告文本。"""
     from src.models.model_router import ModelRouter
 
-    policy = ModelRouter.create_backend("deepseek")
+    # baseline 是单次生成完整报告，推理模型思维链最长（可达 2 万字）
+    # max_tokens 必须足够大（与 summarizer 同级），否则 finish_reason=length，content 为空
+    model_cfg = config.get("model", {})
+    backend_sampling = model_cfg.get("backend_sampling", {})
+    deepseek_cfg = backend_sampling.get("deepseek", {})
+    sampling_kwargs = {
+        "temperature": deepseek_cfg.get("temperature", 0.7),
+        "max_tokens": 32768,
+        "top_p": deepseek_cfg.get("top_p", 1.0),
+    }
+
+    policy = ModelRouter.create_backend("deepseek", **sampling_kwargs)
     messages = [
         {
             "role": "system",
@@ -53,13 +64,23 @@ def run_baseline(query: str, config: dict) -> dict:
         },
         {"role": "user", "content": query},
     ]
-    resp = policy(messages)
-    content = resp.get("content", "")
+    try:
+        resp = policy(messages)
+        content = resp.get("content", "")
+    except Exception as e:
+        content = f"Error: {e}"
+    # 检测错误内容（如 402 余额不足 / 空输出），标记为失败
+    error = (
+        not content.strip()
+        or content.startswith("Error:")
+        or "Insufficient Balance" in content
+    )
     return {
         "query": query,
         "content": content,
-        "length": len(content),
+        "length": len(content) if not error else 0,
         "source_count": content.count("http"),
+        "error": error,
     }
 
 
@@ -73,6 +94,13 @@ async def run_agent(query: str, config: dict) -> dict:
     modules = initialize_modules(config)
     report_md = await run_research(query, config, modules)
 
+    # 检测失败报告（Research failed / 全局超时 / LLM 错误）
+    error = (
+        "Research failed" in report_md
+        or "global timeout" in report_md.lower()
+        or report_md.strip().startswith("Error:")
+    )
+
     # 简单解析元信息
     confidence = 0.0
     if "**置信度**:" in report_md:
@@ -85,9 +113,10 @@ async def run_agent(query: str, config: dict) -> dict:
     return {
         "query": query,
         "content": report_md,
-        "length": len(report_md),
+        "length": len(report_md) if not error else 0,
         "source_count": report_md.count("http"),
         "confidence": confidence,
+        "error": error,
     }
 
 

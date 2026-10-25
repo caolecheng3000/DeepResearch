@@ -9,11 +9,15 @@ VLLM Policy — OpenAI API 封装
 """
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import re
 from typing import Optional
 
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
+from ..utils.execution import remaining, check_deadline
+from ..utils.tracing import trace_chain, record_event
 
 
 __all__ = ["VLLMPolicy", "OpenAICompatibleDict"]
@@ -53,8 +57,10 @@ class VLLMPolicy:
         top_p: float = 1.0,
         max_tokens: int = 1024,
         tools: Optional[list[dict]] = None,
+        thinking_mode: str | None = None,
     ):
-        raw_client = OpenAI(base_url=base_url, api_key=api_key)
+        self._connection = dict(base_url=base_url, api_key=api_key)
+        raw_client = OpenAI(**self._connection, max_retries=0)
         # 如果 LangSmith 追踪开启，自动包装 client 以追踪所有 LLM 调用
         from ..utils.tracing import maybe_wrap_openai_client
         self.client = maybe_wrap_openai_client(raw_client)
@@ -63,6 +69,9 @@ class VLLMPolicy:
         self.top_p = top_p
         self.max_tokens = max_tokens
         self.tools = tools
+        if thinking_mode not in (None, "enabled", "disabled"):
+            raise ValueError("thinking_mode must be enabled, disabled, or None")
+        self.thinking_mode = thinking_mode
         # [污染标记] 一旦发生过主动截断，整条 trajectory 作废
         self.was_truncated = False
 
@@ -137,15 +146,15 @@ class VLLMPolicy:
 
         return system_msgs + kept
 
-    def __call__(self, messages: list) -> OpenAICompatibleDict:
-        """调用 LLM，返回 OpenAI 兼容格式消息。
+    def clone(self):
+        """Independent mutable policy state, sharing only the thread-safe sync transport."""
+        policy = copy.copy(self)
+        policy.tools = copy.deepcopy(self.tools)
+        policy.was_truncated = False
+        return policy
 
-        Args:
-            messages: OpenAI 格式的消息列表。
-
-        Returns:
-            OpenAICompatibleDict: 包含 role, content, tool_calls 字段。
-        """
+    def _prepare_request(self, messages):
+        check_deadline()
         # 1. 深度清洗消息格式
         sanitized = []
         for m in messages:
@@ -156,6 +165,9 @@ class VLLMPolicy:
                 # 修复核心报错：处理 ['observation', '...'] 这种元组格式
                 role = "user" if m[0] in ["observation", "user"] else "assistant"
                 content = str(m[1])
+
+            if not isinstance(m, dict):
+                m = {}
 
             # 过滤环境内部泄露的 Task 对象信息，防止干扰模型
             if "task=Task(" in str(content):
@@ -202,61 +214,89 @@ class VLLMPolicy:
         if self.tools:
             kwargs["tools"] = self.tools
             kwargs["tool_choice"] = "auto"
+        if self.thinking_mode is not None:
+            kwargs["extra_body"] = {"thinking": {"type": self.thinking_mode}}
 
-        try:
-            resp = self.client.chat.completions.create(**kwargs)
-            raw_msg = resp.choices[0].message
-            content = raw_msg.content or ""
+        budget = remaining()
+        kwargs["timeout"] = 60.0 if budget is None else min(60.0, budget)
+        return kwargs
 
-            # 4. [FORBIDDEN] 检测 assistant 是否输出了不该出现的模板标记
-            for forbidden in FORBIDDEN_TEMPLATE_TOKENS:
-                if forbidden in content:
-                    print(f"[FORBIDDEN] Detected '{forbidden}' in assistant content, marking trajectory as contaminated")
-                    self.was_truncated = True
-                    break
+    def _parse_response(self, resp):
+        raw_msg = resp.choices[0].message
+        content = raw_msg.content or ""
 
-            # 5. 解析工具调用 (带正则回退)
-            final_tool_calls = []
-            if raw_msg.tool_calls:
-                for tc in raw_msg.tool_calls:
+        # 4. [FORBIDDEN] 检测 assistant 是否输出了不该出现的模板标记
+        for forbidden in FORBIDDEN_TEMPLATE_TOKENS:
+            if forbidden in content:
+                print(f"[FORBIDDEN] Detected '{forbidden}' in assistant content, marking trajectory as contaminated")
+                self.was_truncated = True
+                break
+
+        # 5. 解析工具调用 (带正则回退)
+        final_tool_calls = []
+        if raw_msg.tool_calls:
+            for tc in raw_msg.tool_calls:
+                final_tool_calls.append(OpenAICompatibleDict(
+                    id=tc.id, type="function",
+                    function=OpenAICompatibleDict(name=tc.function.name, arguments=tc.function.arguments)
+                ))
+        elif "<tool_call>" in content:
+            matches = TOOL_CALL_PATTERN.findall(content)
+            for i, m_str in enumerate(matches):
+                try:
+                    d = json.loads(m_str.strip())
                     final_tool_calls.append(OpenAICompatibleDict(
-                        id=tc.id, type="function",
-                        function=OpenAICompatibleDict(name=tc.function.name, arguments=tc.function.arguments)
+                        id=f"manual_{i}", type="function",
+                        function=OpenAICompatibleDict(name=d.get("name"), arguments=json.dumps(d.get("arguments", {})))
                     ))
-            elif "<tool_call>" in content:
-                matches = TOOL_CALL_PATTERN.findall(content)
-                for i, m_str in enumerate(matches):
-                    try:
-                        d = json.loads(m_str.strip())
-                        final_tool_calls.append(OpenAICompatibleDict(
-                            id=f"manual_{i}", type="function",
-                            function=OpenAICompatibleDict(name=d.get("name"), arguments=json.dumps(d.get("arguments", {})))
-                        ))
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
 
-            # 6. 返回万能对象
-            result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
-            if getattr(raw_msg, "reasoning_content", None):
-                result["reasoning_content"] = raw_msg.reasoning_content
-            return result
+        # 6. 返回万能对象
+        result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
+        raw_usage = getattr(resp, "usage", None)
+        usage = raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else (raw_usage or {})
+        result["usage"] = usage
+        result["usage_source"] = "provider" if usage else "unavailable"
+        result["finish_reason"] = getattr(resp.choices[0], "finish_reason", None)
+        record_event("llm_usage", {"model": self.model_name, "usage_source": result["usage_source"],
+                                  **{k: usage.get(k, 0) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}})
+        if not content and not final_tool_calls:
+            record_event("llm_empty_output", {"finish_reason": result["finish_reason"]})
+        if getattr(raw_msg, "reasoning_content", None):
+            result["reasoning_content"] = raw_msg.reasoning_content
+        return result
 
+    def _handle_error(self, e, messages):
+        from ..utils.recovery import classify_error, RecoveryError
+        status_code = getattr(e, "status_code", None)
+        record_event("llm_error", {"error_type": type(e).__name__, "status_code": status_code,
+            "resource_failure": status_code in (401, 402, 403)})
+        check_deadline()
+        # HTTP failures never become a fake successful assistant message.
+        # call_policy owns retries; outer SDK clients already use max_retries=0.
+        raise RecoveryError(classify_error(e, model=True)) from e
+
+    @trace_chain(name="policy.call")
+    def __call__(self, messages: list) -> OpenAICompatibleDict:
+        kwargs = self._prepare_request(messages)
+        record_event("llm_request", {"model": self.model_name, "max_tokens": self.max_tokens, "thinking_mode": self.thinking_mode})
+        try:
+            return self._parse_response(self.client.chat.completions.create(**kwargs))
         except Exception as e:
-            err_str = str(e)
-            err_lower = err_str.lower()
-            print(f"Policy Error: {err_str}")
+            return self._handle_error(e, messages)
 
-            # Context 超限：确定性错误，立刻中止 trajectory（不继续浪费采样）
-            if "maximum context length" in err_lower or "context length" in err_lower:
-                n_msgs = len(messages)
-                total_chars = sum(len(str(m.get("content", ""))) for m in messages if isinstance(m, dict))
-                raise RuntimeError(
-                    f"[CONTEXT_LENGTH_EXCEEDED] n_msgs={n_msgs}, est_chars={total_chars}: {err_str}"
-                ) from e
-
-            # 其他错误（网络抖动、vLLM 临时 busy 等）：返回假 assistant，让 trajectory 有机会继续
-            return OpenAICompatibleDict(
-                role="assistant",
-                content=f"Error: {err_str}",
-                tool_calls=[]
-            )
+    @trace_chain(name="policy.acall")
+    async def acall(self, messages: list) -> OpenAICompatibleDict:
+        """Native async HTTP; cancellation closes the in-flight request and transport."""
+        kwargs = self._prepare_request(messages)
+        record_event("llm_request", {"model": self.model_name, "max_tokens": self.max_tokens, "thinking_mode": self.thinking_mode})
+        try:
+            # Request-scoped client avoids clients tied to a closed asyncio.run loop.
+            async with AsyncOpenAI(**self._connection, max_retries=0) as raw_client:
+                from ..utils.tracing import maybe_wrap_openai_client
+                client = maybe_wrap_openai_client(raw_client)
+                response = await client.chat.completions.create(**kwargs)
+                return self._parse_response(response)
+        except Exception as e:
+            return self._handle_error(e, messages)

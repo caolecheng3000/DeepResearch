@@ -1,0 +1,86 @@
+{
+  "id": "research_regression_design",
+  "title": "怎样构造能发现研究退化的回归集？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "借鉴CheckList、TruthfulQA、FActScore和AgentBench，为深度研究系统设计小而有效的回归集。覆盖问题重述、条件变化、来源冲突、证据缺失与长程执行；区分工程测试、研究能力评测和裁判校准，给出样本组织与结果分析方法。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Beyond Accuracy: Behavioral Testing of NLP models with CheckList\n- TruthfulQA: Measuring How Models Mimic Human Falsehoods\n- FActScore: Fine-grained Atomic Evaluation of Factual Precision in Long Form Text Generation\n- AgentBench: Evaluating LLMs as Agents\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "checklist",
+    "truthfulqa",
+    "factscore",
+    "agentbench"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "行为矩阵",
+      "expected": "CheckList以能力和测试类型组织行为测试，最小功能、不变性和方向性测试不同于单个总体准确率。",
+      "source_ids": [
+        "checklist"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "最小对比",
+      "expected": "研究回归可以只改关键条件或证据，预先说明哪些结论应变、哪些应保持，而不是任意换几个数字充样本量。",
+      "source_ids": [
+        "checklist"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "错误信念",
+      "expected": "TruthfulQA启发针对常见误解设计诊断，但不能把其题目直接当完整研究报告基准。",
+      "source_ids": [
+        "truthfulqa"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "支持与遗漏",
+      "expected": "事实支持和问题覆盖需要分别标注；FActScore式支持比例不能单独表示所有研究要求。",
+      "source_ids": [
+        "factscore"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "分层运行",
+      "expected": "确定性工程回归、证据绑定裁判诊断和端到端交互研究应分别报告，不能混合通过率。",
+      "source_ids": [
+        "agentbench",
+        "checklist"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "泛化边界",
+      "expected": "按问题族而非模板变体解释样本量，记录版本、重复运行与人工审查，公开题及开发题不称作盲测保留集。",
+      "source_ids": [
+        "checklist",
+        "agentbench"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

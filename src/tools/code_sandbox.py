@@ -1,19 +1,18 @@
 """
 代码沙箱工具
 
-模拟执行 Python 代码，返回 stdout / stderr / 返回值。
-当前为安全模拟版：仅解析简单表达式或返回预定义结果，不真正执行任意代码。
-生产环境可替换为 Docker 沙箱或受限子进程。
+提供 mock 和受限表达式执行，返回 stdout / stderr / 返回值。
+真实模式在 AST 检查后，通过独立 Python 子进程 eval 表达式并限制 builtins；
+超时或取消时终止并回收进程。该限制不等于操作系统级安全隔离。
 """
 from __future__ import annotations
 
 import ast
+import json
+from ..utils.execution import deadline_scope, bounded
 import asyncio
-import io
 import random
 import sys
-import traceback
-from contextlib import redirect_stdout, redirect_stderr
 from typing import Any
 
 
@@ -148,40 +147,35 @@ class CodeSandboxTool:
                         "success": False,
                     }
 
-        # 3. 在受限环境中执行
-        def _run() -> dict[str, Any]:
-            safe_globals = {"__builtins__": {}}
-            safe_locals: dict[str, Any] = {}
-            stdout_buf = io.StringIO()
-            stderr_buf = io.StringIO()
-            try:
-                with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-                    result = eval(code, safe_globals, safe_locals)
-                return {
-                    "stdout": stdout_buf.getvalue(),
-                    "stderr": stderr_buf.getvalue(),
-                    "return_value": result,
-                    "success": True,
-                }
-            except Exception:
-                return {
-                    "stdout": stdout_buf.getvalue(),
-                    "stderr": traceback.format_exc(),
-                    "return_value": None,
-                    "success": False,
-                }
-
+        # A thread cannot be killed on timeout; execute expressions in a child
+        # process so cancellation can terminate CPU work and reap the process.
+        script = """import json,sys,traceback
+code = json.loads(sys.argv[1])
+try:
+    result = eval(code, {"__builtins__": {}}, {})
+    output = {"stdout": "", "stderr": "", "return_value": result, "success": True}
+except Exception:
+    output = {"stdout": "", "stderr": traceback.format_exc(), "return_value": None, "success": False}
+print(json.dumps(output, default=str))
+"""
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-c", script, json.dumps(code),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            # 使用 asyncio 的 run_in_executor 避免阻塞事件循环
-            loop = asyncio.get_running_loop()
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, _run),
-                timeout=timeout,
-            )
+            with deadline_scope(seconds=timeout):
+                stdout, stderr = await bounded(process.communicate())
+            if process.returncode != 0:
+                return {"stdout": "", "stderr": stderr.decode(errors="replace"),
+                        "return_value": None, "success": False}
+            return json.loads(stdout)
         except asyncio.TimeoutError:
-            return {
-                "stdout": "",
-                "stderr": f"TimeoutError: execution exceeded {timeout}s",
-                "return_value": None,
-                "success": False,
-            }
+            return {"stdout": "", "stderr": f"TimeoutError: execution exceeded {timeout}s",
+                    "return_value": None, "success": False}
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.communicate()

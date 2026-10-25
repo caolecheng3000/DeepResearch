@@ -10,6 +10,8 @@ LLM Summarizer 模块：层级摘要
 
 from __future__ import annotations
 
+from ..utils.execution import call_policy
+
 import logging
 from typing import Any, Optional
 
@@ -159,6 +161,35 @@ class LLMSummarizer:
         except Exception as e:
             logger.error(f"LLM summarize_documents failed: {e}")
             return "\n\n".join(single_summaries)
+
+    async def asummarize_document(self, doc, query="", max_length=500):
+        if not doc or len(doc) < max_length:
+            return doc.strip()
+        prompt = _DOCUMENT_SUMMARY_PROMPT.format(doc=doc, max_length=max_length)
+        if query:
+            prompt = f"用户查询：{query}\n\n" + prompt
+        try:
+            response = await call_policy(self.llm_policy, [{"role": "user", "content": prompt}])
+            return str(response.content or "").strip() or doc[:max_length] + "\n[TRUNCATED]"
+        except Exception:
+            return doc[:max_length] + "\n[TRUNCATED]"
+
+    async def asummarize_documents(self, docs, query="", max_length=800, skip_single_summary=False):
+        if not docs:
+            return ""
+        if len(docs) == 1:
+            return await self.asummarize_document(docs[0], query, max_length)
+        summaries = []
+        for i, doc in enumerate(docs, 1):
+            summary = doc if skip_single_summary else await self.asummarize_document(
+                doc, query, max(200, max_length // len(docs)))
+            summaries.append(f"[文档{i}]\n{summary}")
+        prompt = _AGGREGATE_SUMMARY_PROMPT.format(query=query, docs="\n\n".join(summaries), max_length=max_length)
+        try:
+            response = await call_policy(self.llm_policy, [{"role": "user", "content": prompt}])
+            return str(response.content or "").strip() or "\n\n".join(summaries)
+        except Exception:
+            return "\n\n".join(summaries)
 
     def get_stats(self, original_docs: list[str], summary: str) -> dict[str, Any]:
         """

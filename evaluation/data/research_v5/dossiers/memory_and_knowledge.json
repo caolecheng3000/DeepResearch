@@ -1,0 +1,89 @@
+{
+  "id": "memory_and_knowledge",
+  "title": "持久记忆与知识库应该怎样分工？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "为可连续开展研究的助手设计记忆架构：比较MemGPT的分层记忆、RAG的外部知识检索与Reflexion的经验反馈。解释文献事实、用户约束和失败经验各应保存什么，何时读取，如何处理旧结论、版本更新和引用。设计能区分记住经验与重复利用答案的实验。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- MemGPT: Towards LLMs as Operating Systems\n- Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks\n- Reflexion: an autonomous agent with dynamic memory and self-reflection\n- Lost in the Middle: How Language Models Use Long Contexts\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "memgpt",
+    "rag",
+    "reflexion",
+    "lost"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "分层记忆",
+      "expected": "MemGPT借鉴操作系统的分层与虚拟上下文思路管理有限上下文，不代表模型参数获得永久更新。",
+      "source_ids": [
+        "memgpt"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "知识与经验",
+      "expected": "RAG检索外部知识，Reflexion将语言反馈保存为情景经验；两者存储对象与使用目的不同。",
+      "source_ids": [
+        "rag",
+        "reflexion"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "读取时机",
+      "expected": "可按规划、研究和合成阶段分别读取相关事实或经验；这是拟议架构，应与原论文已验证行为分开。",
+      "source_ids": [
+        "memgpt",
+        "rag"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "追溯与更新",
+      "expected": "建议保留来源、时间、条件及版本，并区分先前推断与原始证据；历史结论不能自动作为新独立证据。",
+      "source_ids": [
+        "rag",
+        "memgpt"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "上下文限制",
+      "expected": "增加历史长度不能保证使用效果，应检查位置偏差、无关记忆和冲突内容。",
+      "source_ids": [
+        "lost",
+        "memgpt"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "实验隔离",
+      "expected": "用独立会话及不同后续问题，对比无记忆、事实记忆、经验记忆和二者结合，防止把目标答案预置为记忆后宣称泛化。",
+      "source_ids": [
+        "reflexion",
+        "memgpt"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

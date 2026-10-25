@@ -1,0 +1,29 @@
+# Real DeepSeek integration validation: M1-M5 active, one complete Red/Blue round.
+# M6 weight training is outside this report evaluation experiment.
+model:
+  backend: deepseek
+  backend_mapping: {solver: deepseek, planner: deepseek, summarizer: deepseek, compressor: deepseek, judge: deepseek, red_agent: deepseek, blue_agent: deepseek}
+  backend_sampling:
+    deepseek: {temperature: 0.1, max_tokens: 8192, top_p: 1.0}
+    modules:
+      # Verified first-pass 8192-token reviews truncated on 8/18 reports;
+      # all eight saved reports passed a separate 16384-token replay.
+      judge: {temperature: 0.1, max_tokens: 16384, top_p: 1.0}
+orchestrator:
+  max_concurrent: 2
+  global_timeout_seconds: 600
+  max_replan_rounds: 1
+  max_sub_questions: 2
+  researcher_max_turns: 3
+  report_min_chars: 300
+planner:
+  search_calls: 1
+compressor:
+  enable_multilevel: true
+  max_context_length: 16000
+  output_reserve_tokens: 2048
+memory: {enabled: true, max_entries: 100, enable_vector_index: false}
+adversarial: {enabled: true, max_rounds: 1, max_issues_per_round: 3, score_threshold: 9.5, delta_threshold: 0.2}
+evolution: {enabled: false}
+tools:
+  snapshot_path: evaluation/data/research_report_v2.json

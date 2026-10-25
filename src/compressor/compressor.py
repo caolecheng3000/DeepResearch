@@ -14,6 +14,8 @@ Context Compressor 模块：统一压缩入口
 
 from __future__ import annotations
 
+from ..utils.execution import run_sync
+
 import logging
 import re
 from typing import Any, Optional
@@ -23,7 +25,7 @@ from src.models.vllm_policy import VLLMPolicy
 from src.compressor.extractive import ExtractiveCompressor
 from src.compressor.sliding_window import SlidingWindowCompressor
 from src.compressor.summarizer import LLMSummarizer
-from src.utils.tracing import trace_chain
+from src.utils.tracing import trace_chain, record_event
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,7 @@ class ContextCompressor:
         # 统计累积
         self._stats_history: list[dict[str, Any]] = []
 
+    @trace_chain(name="compressor.collect_l2")
     def compress_documents(
         self,
         texts: list[str],
@@ -208,6 +211,34 @@ class ContextCompressor:
         self._record_stats(texts, compressed, level, self.calculate_tokens(compressed))
         return compressed
 
+    @trace_chain(name="compressor.acompress")
+    async def acompress(self, texts, query="", level=None, system_prompt_tokens=0):
+        """Async equivalent: CPU extraction off-loop, native cancellable LLM summaries."""
+        if not texts:
+            return []
+        budget = self.available_budget - system_prompt_tokens
+        if budget <= 0:
+            budget = self.available_budget // 2
+        usage = self.calculate_tokens(texts) / max(budget, 1)
+        if level is None:
+            level = 3 if usage > _L3_THRESHOLD else 2 if usage > _L2_THRESHOLD else 1 if usage > _L1_THRESHOLD else 0
+        output = list(texts)
+        if level >= 1:
+            output = await run_sync(self._l1_filter, output, query, budget)
+        if level >= 2 and output:
+            output = await run_sync(self._l2_extract, output, query, budget)
+        if level >= 3 and output:
+            single_max = max(200, budget // len(output))
+            summaries = [await self.summarizer.asummarize_document(t, query, single_max) for t in output]
+            output = [await self.summarizer.asummarize_documents(
+                summaries, query, max(400, budget // 2), skip_single_summary=True)]
+        if self.calculate_tokens(output) > budget:
+            messages = [{"role": "user", "content": t} for t in output]
+            output = [m["content"] for m in self.sliding.compress(messages)]
+        self._record_stats(texts, output, level, self.calculate_tokens(output))
+        return output
+
+    @trace_chain(name="compressor.l1")
     def _l1_filter(
         self,
         texts: list[str],
@@ -258,6 +289,7 @@ class ContextCompressor:
         )
         return best_result
 
+    @trace_chain(name="compressor.l2")
     def _l2_extract(
         self,
         texts: list[str],
@@ -287,6 +319,7 @@ class ContextCompressor:
         )
         return compressed
 
+    @trace_chain(name="compressor.l3")
     def _l3_summarize(
         self,
         texts: list[str],
@@ -352,6 +385,8 @@ class ContextCompressor:
             "information_retention": round(retention, 3),
         }
         self._stats_history.append(stats)
+        record_event("compression", {**stats, "token_source": "character_estimate",
+                                    "retention_source": "entity_heuristic"})
 
     def _estimate_retention(
         self,

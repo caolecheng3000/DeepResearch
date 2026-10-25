@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deep-research-agent"
 version = "0.1.0"
-description = "基于自进化+对抗降噪的DeepResearch Agent"
+description = "Deep-Research: multi-agent research with evidence retrieval, memory, compression, adversarial review, and evaluation"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "DeepResearch Team"},
+    {name = "Deep-Research contributors"},
 ]
 keywords = ["deep-research", "agent", "llm", "self-evolution", "adversarial", "multi-agent"]
 classifiers = [
@@ -49,6 +49,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+observability = ["langsmith>=0.3.13,<1"]
+docs = ["python-docx>=1.1,<2"]
 # vLLM 推理服务依赖
 serve = [
     "vllm>=0.4.0",
@@ -84,9 +86,9 @@ run-judge = "scripts.run_judge:main"
 run-evolution = "scripts.run_evolution:main"
 
 [project.urls]
-Homepage = "https://github.com/deepresearch/deep-research-agent"
-Repository = "https://github.com/deepresearch/deep-research-agent"
-Issues = "https://github.com/deepresearch/deep-research-agent/issues"
+Homepage = "https://github.com/caolecheng3000/DeepResearch"
+Repository = "https://github.com/caolecheng3000/DeepResearch"
+Issues = "https://github.com/caolecheng3000/DeepResearch/issues"
 
 [tool.setuptools]
 packages = ["src", "evaluation", "scripts", "configs"]

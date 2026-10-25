@@ -1,0 +1,88 @@
+{
+  "id": "scaling_or_adaptation",
+  "title": "计算预算有限时该扩大模型还是改善适配？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "综合Chinchilla、LoRA和QLoRA，讨论预训练计算分配与下游领域适配的区别。为研究助手团队分别提出从头预训练和已有底座适配的研究路线，列出决策依赖的数据、算力与评价证据；不可把训练缩放结论直接套成微调配方。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Training Compute-Optimal Large Language Models\n- LoRA: Low-Rank Adaptation of Large Language Models\n- QLoRA: Efficient Finetuning of Quantized LLMs\n- Green AI\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "chinchilla",
+    "lora",
+    "qlora",
+    "greenai"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "缩放对象",
+      "expected": "Chinchilla研究固定预训练计算预算下参数量与训练数据的分配，不是直接比较LoRA超参数。",
+      "source_ids": [
+        "chinchilla"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "结果范围",
+      "expected": "其计算最优结论来自论文的实验范围与拟合，不能作为任意架构、数据和目标下的普适常数。",
+      "source_ids": [
+        "chinchilla"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "适配对象",
+      "expected": "LoRA与QLoRA利用已有底座进行参数高效适配，解决的预算阶段与从头预训练不同。",
+      "source_ids": [
+        "lora",
+        "qlora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "数据角色",
+      "expected": "需要区分预训练Token、领域适配数据与带来源的研究材料，不能把三者互相替代。",
+      "source_ids": [
+        "chinchilla",
+        "lora"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "研究报告",
+      "expected": "Green AI强调同时报告效率和质量，选型应明示成本计量范围及可运行基线。",
+      "source_ids": [
+        "greenai"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "路线条件",
+      "expected": "可接受不同路线；必须说明资源前提、质量目标和验证方法，不能仅凭模型参数越大推断研究质量越高。",
+      "source_ids": [
+        "chinchilla",
+        "qlora",
+        "greenai"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

@@ -24,9 +24,11 @@ class JudgeBasedMetrics:
         query: str,
         ground_truth: dict[str, Any] | None = None,
         backend: str = "deepseek",
+        requirements: dict | None = None,
+        evidence: list[dict] | None = None,
     ) -> dict[str, Any]:
         """
-        使用 MiMo 2.5 Pro 作为 Judge 对报告进行多维度评分。
+        使用配置的 Judge 对报告进行任务契约与五维锚点评分。
 
         当规则指标不足以精确评估时，调用此方法获取 LLM 的定性判断。
         返回结构包含事实准确性、逻辑一致性、引用质量、整体置信度。
@@ -43,4 +45,4 @@ class JudgeBasedMetrics:
         from src.core.judge import LLMJudge
 
         judge = LLMJudge(backend=backend)
-        return judge.score_single(report, query, ground_truth)
+        return judge.score_report(report, query, ground_truth, requirements, evidence)

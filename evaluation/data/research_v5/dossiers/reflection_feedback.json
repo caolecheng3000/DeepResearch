@@ -1,0 +1,88 @@
+{
+  "id": "reflection_feedback",
+  "title": "反思何时能改善研究结果？",
+  "annotation_status": "draft_for_user_review",
+  "review_status": "not_reviewed",
+  "question": "评估把Reflexion式反馈加入研究助手的价值。比较语言反馈、重试和ReAct式工具交互，讨论反馈可靠性、跨轮经验以及错误自我强化。给出包含无反思、仅重试和外部证据反馈的对照，说明如何避免把更多Token造成的收益误归因于反思。\n\n本题材料范围（固定v1，可按英文题名或方法名检索）：\n\n- Reflexion: an autonomous agent with dynamic memory and self-reflection\n- ReAct: Synergizing Reasoning and Acting in Language Models\n- SWE-bench: Can Language Models Resolve Real-World GitHub Issues?\n- Judging LLM-as-a-judge with MT-Bench and Chatbot Arena\n\n本次论证以所列材料为依据；材料未提供的最新进展、数字和实验结果应列为待验证，不能自行补造。\n\n交付要求：基于固定论文材料撰写中文研究报告，建议1800—4500字，含可追溯的来源URL；合同按非空白字符计1800—9000字符，包含Markdown、标点与URL。报告至少包括研究问题与范围、方法或证据比较、结论边界和待验证实验。可以给出不同的条件性建议，但必须解释证据链、反例或不确定性。原文中的已测结果、你的推断和拟议设计要明确区分；引用数字必须附任务、模型与测量条件。工具搜索整个固定论文池；browser返回选定原文摘录而非论文全文，不联网补全；材料无法支持的结论请列为待验证，不猜测缺失数据。可使用英文方法名与关键词检索。材料固定为各论文v1历史版本，不要求回答当前最新进展。",
+  "source_ids": [
+    "reflexion",
+    "react",
+    "swebench",
+    "mtbench"
+  ],
+  "reference_points": [
+    {
+      "id": "fact_1",
+      "topic": "语言强化",
+      "expected": "Reflexion使用语言反馈和情景记忆改善后续尝试，不是通过该交互循环直接更新模型权重。",
+      "source_ids": [
+        "reflexion"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_2",
+      "topic": "反馈条件",
+      "expected": "反馈可能来自环境或评估机制，模型自评不保证正确，需要区分反馈来源。",
+      "source_ids": [
+        "reflexion",
+        "mtbench"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_3",
+      "topic": "行动关系",
+      "expected": "ReAct组织推理与行动，Reflexion关注尝试后的反馈及记忆，二者可以组合但不等同。",
+      "source_ids": [
+        "react",
+        "reflexion"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_4",
+      "topic": "外部检验",
+      "expected": "SWE-bench使用真实仓库问题与测试评价修复，说明外部可执行验证是一类反馈；测试通过也不等价于所有研究结论正确。",
+      "source_ids": [
+        "swebench"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_5",
+      "topic": "预算控制",
+      "expected": "需要等尝试数或等Token预算的重试基线，保存逐轮产物，区分额外计算与反馈质量。",
+      "source_ids": [
+        "reflexion",
+        "react"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    },
+    {
+      "id": "fact_6",
+      "topic": "停止与退化",
+      "expected": "建议记录修订前后事实支持变化、错误反复及停止理由，不能只展示最终成功案例或默认更多轮更好。",
+      "source_ids": [
+        "reflexion",
+        "mtbench"
+      ],
+      "verification": "draft_requires_span_level_human_review"
+    }
+  ],
+  "acceptable_alternatives": "不要求唯一技术选型；不同建议必须满足问题约束，并有材料支持、适用条件及可检验理由。",
+  "critical_errors": [
+    "编造论文实验或数字",
+    "把跨论文不可比结果当成统一排名",
+    "把拟议系统设计写成论文已经实现的事实",
+    "忽略证据适用范围并给无条件结论"
+  ],
+  "review_checklist": [
+    "问题需要多来源综合而非单段查找",
+    "原文版本与材料完整性已核对",
+    "每条参考要点有具体原文片段支持或明确属于设计要求",
+    "允许合理替代建议且不存在隐藏答案或引用白名单",
+    "结论边界、反例与实验设计均可评分"
+  ],
+  "rubric_note": "沿用现有report-rubric-v1：事实与论证、引用、覆盖、清晰度；六条参考要点进入现有逐事实评审。独立的方法学评分器尚未实现，不声称存在新的深度研究总分。"
+}

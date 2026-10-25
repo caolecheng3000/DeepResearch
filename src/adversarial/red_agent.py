@@ -11,6 +11,8 @@ Red Agent 的职责是对研究报告进行多维度"攻击"，找出事实错�
 """
 from __future__ import annotations
 
+from ..utils.execution import call_policy, bounded, check_deadline
+
 import asyncio
 import json
 import re
@@ -249,9 +251,9 @@ class RedAgent:
         max_tokens: 单次评估的最大输出 token 数。
     """
 
-    def __init__(self, policy, max_tokens: int = 2048):
+    def __init__(self, policy, max_tokens: int | None = None):
         self.policy = policy
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens if max_tokens is not None else getattr(policy, "max_tokens", 8192)
 
     @trace_agent(name="red_agent.attack", tags=["m5", "red", "adversarial"])
     async def attack(self, report: ResearchReport) -> RedVerdict:
@@ -285,7 +287,10 @@ class RedAgent:
                                      sources_text if needs_sources else "")
                 for name, prompt, needs_sources in _COMBINED_DIMENSIONS
             ]
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failures = [r for r in results if isinstance(r, BaseException)]
+            if failures:
+                raise failures[0]
         finally:
             # 恢复原始 max_tokens
             if old_max is not None:
@@ -304,10 +309,8 @@ class RedAgent:
                     dimension_scores[dim] = score
                     all_issues.extend(issues)
 
-        # 确保所有 5 个维度都有分数（解析失败时回退到 5.0）
-        for dim in Dimension:
-            if dim not in dimension_scores:
-                dimension_scores[dim] = 5.0
+        if set(dimension_scores) != set(Dimension):
+            raise ValueError("Red assessment incomplete: missing required dimensions")
 
         overall = VerdictEngine.compute_overall(dimension_scores)
         return RedVerdict(
@@ -328,7 +331,7 @@ class RedAgent:
         Returns:
             (dimension_name, raw_response, [(sub_key, score, issues), ...])
         """
-        prompt = prompt_template
+        prompt = prompt_template.replace("{{", "{").replace("}}", "}")
         prompt = prompt.replace("{query}", query)
         prompt = prompt.replace("{content}", content)
         prompt = prompt.replace("{sources}", sources)
@@ -355,7 +358,7 @@ class RedAgent:
         )
 
         async def _call_policy(msgs):
-            return self.policy(msgs)
+            return await call_policy(self.policy, msgs)
 
         data = await retry_with_schema_feedback(
             policy_call=_call_policy,
@@ -364,14 +367,8 @@ class RedAgent:
             max_retries=2,
         )
 
-        # Schema 校验全部失败 → 降级：用原始解析
         if data is None:
-            try:
-                resp = self.policy(messages[:2])  # 用初始 messages 重试最后一次
-                raw = resp.content or ""
-            except Exception:
-                raw = "{}"
-            parsed = self._parse_combined_json(raw)
+            raise ValueError(f"Red assessment {name} failed schema validation after retries")
         else:
             # 校验通过，但需要确保缺失的子维度有兜底分数
             raw = str(data)

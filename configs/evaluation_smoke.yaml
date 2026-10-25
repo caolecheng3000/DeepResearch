@@ -1,0 +1,37 @@
+# Bounded real-DeepSeek validation on human-authored, fixed evidence.
+model:
+  backend: deepseek
+  backend_mapping:
+    solver: deepseek
+    planner: deepseek
+    summarizer: deepseek
+    compressor: deepseek
+    judge: deepseek
+  backend_sampling:
+    deepseek: {temperature: 0.1, max_tokens: 4096, top_p: 1.0}
+    modules:
+      judge: {temperature: 0.1, max_tokens: 4096, top_p: 1.0}
+orchestrator:
+  max_concurrent: 2
+  global_timeout_seconds: 240
+  max_replan_rounds: 0
+  max_sub_questions: 2
+  researcher_max_turns: 3
+  report_min_chars: 400
+planner:
+  search_calls: 0
+compressor:
+  enable_multilevel: true
+  max_context_length: 16000
+  output_reserve_tokens: 2048
+memory:
+  enabled: true
+  max_entries: 100
+  enable_vector_index: false
+adversarial:
+  enabled: false
+  max_rounds: 0
+evolution:
+  enabled: false
+tools:
+  snapshot_path: evaluation/data/research_regression_v1.json

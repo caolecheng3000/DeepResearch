@@ -49,7 +49,7 @@ class BaseBrowserTool(ABC):
     )
 
     @abstractmethod
-    async def execute(self, url: str, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
+    async def execute(self, url: str, max_chars: int = _DEFAULT_MAX_CHARS) -> str | dict:
         """打开 URL，提取正文。
 
         Args:
@@ -120,6 +120,10 @@ class BrowserTool(BaseBrowserTool):
 
             return text if text else "[Browser Warning] No meaningful content extracted from the page."
 
+        except aiohttp.ClientResponseError as e:
+            from ..utils.recovery import public_message
+            return {"error": public_message(e), "status_code": e.status,
+                    "retry_after": (e.headers or {}).get("Retry-After")}
         except aiohttp.ClientError as e:
             return f"[Browser Error] Network error: {type(e).__name__}: {e}"
         except Exception as e:

@@ -21,6 +21,7 @@ def bootstrap_ci_paired(
     diffs: list[float],
     n_bootstrap: int = 10000,
     confidence: float = 0.95,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """
     配对差异的 bootstrap 置信区间。
@@ -39,9 +40,10 @@ def bootstrap_ci_paired(
     diffs_arr = np.array(diffs)
     mean_diff = float(np.mean(diffs_arr))
 
+    rng = np.random.default_rng(seed)
     boot_means = []
     for _ in range(n_bootstrap):
-        sample = np.random.choice(diffs_arr, size=len(diffs_arr), replace=True)
+        sample = rng.choice(diffs_arr, size=len(diffs_arr), replace=True)
         boot_means.append(float(np.mean(sample)))
 
     boot_means = np.array(boot_means)

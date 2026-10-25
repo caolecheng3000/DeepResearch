@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -18,6 +19,25 @@ __all__ = ["ensure_env_loaded", "get_env", "get_env_int", "get_env_float", "get_
 
 
 _ENV_LOADED = False
+
+# 项目根目录（src/utils/env_config.py -> src/utils -> src -> 项目根）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _env_search_dirs() -> list[Path]:
+    """按优先级从低到高返回 .env 搜索目录。
+
+    项目根目录优先于 cwd：这样即使从任意目录启动脚本（绝对路径调用、cron、
+    编辑器里直接 run），也能拿到项目级配置；cwd 下的 .env 仍可覆盖它。
+    """
+    dirs: list[Path] = [_PROJECT_ROOT]
+    try:
+        cwd = Path(os.getcwd()).resolve()
+    except OSError:  # pragma: no cover - cwd 被删除等极端情况
+        return dirs
+    if cwd not in dirs:
+        dirs.append(cwd)
+    return dirs
 
 
 def ensure_env_loaded() -> None:
@@ -31,15 +51,12 @@ def ensure_env_loaded() -> None:
     if _ENV_LOADED:
         return
 
-    # 1. 加载项目级 .env
-    env_path = os.path.join(os.getcwd(), ".env")
-    if os.path.exists(env_path):
-        load_dotenv(dotenv_path=env_path)
-
-    # 2. 加载用户级 .env.local（优先级更高）
-    local_env = os.path.join(os.getcwd(), ".env.local")
-    if os.path.exists(local_env):
-        load_dotenv(dotenv_path=local_env, override=True)
+    for directory in _env_search_dirs():
+        for name in (".env", ".env.local"):
+            env_path = directory / name
+            if env_path.exists():
+                # .env.local 允许覆盖已存在的环境变量，.env 不覆盖
+                load_dotenv(dotenv_path=str(env_path), override=(name == ".env.local"))
 
     _ENV_LOADED = True
 

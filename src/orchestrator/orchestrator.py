@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+import uuid
 from typing import Any, Callable
 
 from .schemas import (
@@ -31,7 +32,9 @@ from .agent_pool import AgentPool
 from ..planner.dag import DAG
 from ..planner.planner import Planner, PlanParseError
 from ..planner.budget_tracker import BudgetTracker
-from ..utils.tracing import trace_chain
+from ..utils.tracing import trace_chain, trace_block, current_run_id, record_event
+from ..utils.execution import deadline_scope, bounded, run_sync, check_deadline
+from ..utils.recovery import recovery_scope, current_recovery, ResearchAbort, Failure, public_message
 
 # M4: Memory Store 类型提示（延迟导入避免循环依赖）
 SharedMemoryStore = Any
@@ -60,6 +63,7 @@ class Orchestrator:
         adversarial_loop: Any | None = None,
         memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
+        force_adversarial: bool = False,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -68,6 +72,13 @@ class Orchestrator:
         self.adversarial_loop = adversarial_loop
         self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
+        self.force_adversarial = force_adversarial
+        self.pre_adversarial_report = None
+        if summarizer_policy is not None:
+            self.agent_pool.summarizer_policy_factory = (
+                summarizer_policy.clone if hasattr(summarizer_policy, "clone")
+                else lambda: copy.deepcopy(summarizer_policy)
+            )
 
         # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
         self._memory_store: dict[str, Any] = {}
@@ -80,6 +91,9 @@ class Orchestrator:
         self._start_time: float = 0.0
         self._replan_count: int = 0
         self._adversarial_count: int = 0
+        self._running = False
+        self._run_id = ""
+        self._reusable_results = {}
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -109,37 +123,100 @@ class Orchestrator:
         Returns:
             ResearchReport: 最终研究报告。
         """
+        if self._running:
+            raise RuntimeError("An Orchestrator cannot run two queries concurrently; create a separate instance")
+        self._running = True
+        self._run_id = current_run_id() or uuid.uuid4().hex
+        run_config = config or RunConfig()
         self._query = query
-        self._config = config or RunConfig()
+        self._config = run_config
         self._start_time = time.monotonic()
         self._replan_count = 0
         self._adversarial_count = 0
         self._memory_store.clear()
+        self.pre_adversarial_report = None
         self._results.clear()
         self._dag = None
         self._task_map.clear()
+        self._reusable_results.clear()
         self._current_state = OrchestratorState.IDLE
 
+        try:
+            with recovery_scope(getattr(self.agent_pool, "recovery_config", None)) as state:
+                with deadline_scope(seconds=run_config.global_timeout_seconds):
+                    try:
+                        report = await bounded(self._run_once(query, run_config))
+                    except asyncio.TimeoutError:
+                        self._current_state = OrchestratorState.DONE
+                        report = self._deadline_report()
+                    except ResearchAbort as exc:
+                        self._current_state = OrchestratorState.FAILED
+                        report = self._abort_report(exc)
+                    except Exception as exc:
+                        self._current_state = OrchestratorState.FAILED
+                        report = self._abort_report(ResearchAbort(Failure(5,
+                            "UNHANDLED_RESEARCH_ERROR", public_message(exc), "research")))
+                report.recovery.update({"tool_calls": state.tool_calls, "model_calls": state.model_calls,
+                    "recovery_actions": state.recovery_actions, "estimated_reserved_tokens": state.estimated_tokens})
+                return report
+        except asyncio.CancelledError:
+            self._current_state = OrchestratorState.FAILED
+            record_event("research_termination", {"level": 5, "code": "CANCELLED"})
+            raise
+        finally:
+            self._running = False
+
+    def _abort_report(self, exc):
+        """L5: no model calls; preserve already completed evidence and the explicit cause."""
+        report = self._memory_store.get("final_report")
+        had_report = bool(report and report.content)
+        saved = {r.task_id: r for r in self._results if r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output}
+        for item in self._memory_store.values():
+            if isinstance(item, AgentResult) and item.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and item.output:
+                saved[item.task_id] = item
+        if report is None:
+            content = "研究已停止，以下内容尚未完成最终核验。\n原因：" + public_message(exc)
+            content += "".join(f"\n\n## {key}\n{item.output}" for key, item in saved.items())
+            report = ResearchReport(query=self._query, content=content)
+        if had_report:
+            report.content += "\n\n## 研究终止说明\n" + public_message(exc)
+        report.status = "partial" if had_report or saved else "failed"
+        report.num_replan = self._replan_count
+        report.recovery = {"level": 5, "code": exc.failure.code, "message": exc.failure.message}
+        self._memory_store["final_report"] = report
+        record_event("research_termination", report.recovery)
+        return report
+
+    def _deadline_report(self):
+        """No new external work after deadline: preserve an existing report or completed evidence."""
+        report = self._memory_store.get("final_report")
+        if report is None:
+            successes = {r.task_id: r for r in self._results if r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL)}
+            for value in self._memory_store.values():
+                if isinstance(value, AgentResult) and value.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL):
+                    successes[value.task_id] = value
+            content = "研究已达到总时间上限，以下是已完成任务的结果；尚未完成最终核验。"
+            for task_id, result in successes.items():
+                content += f"\n\n## {task_id}\n{result.output}"
+            report = ResearchReport(query=self._query, content=content, confidence=0.0)
+        report.num_replan = self._replan_count
+        report.adversarial_rounds = self._adversarial_count
+        report.status = "timeout"
+        report.recovery.update({"level": 5, "code": "GLOBAL_TIMEOUT"})
+        record_event("global_timeout", {"partial_report": bool(report.content)})
+        self._memory_store["final_report"] = report
+        return report
+
+    async def _run_once(self, query, config):
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
-            # 全局超时检查
-            if self._is_global_timeout():
-                if self._current_state in (
-                    OrchestratorState.COLLECTING,
-                    OrchestratorState.SYNTHESIZING,
-                    OrchestratorState.ADVERSARIAL,
-                ):
-                    # 强制合成：用已有结果生成报告
-                    self._current_state = OrchestratorState.SYNTHESIZING
-                else:
-                    self._current_state = OrchestratorState.FAILED
-                break
-
             handler = self._state_handlers.get(self._current_state)
             if handler is None:
                 raise RuntimeError(f"Unknown state: {self._current_state}")
 
-            next_state = await handler()
+            with trace_block(f"stage.{self._current_state.value}",
+                             metadata={"replan_round": self._replan_count}):
+                next_state = await bounded(handler())
             self._current_state = next_state
 
             print(f"[Orchestrator] State transition: {self._current_state.value}")
@@ -152,13 +229,15 @@ class Orchestrator:
                 report = ResearchReport(query=query, content="Report generation failed unexpectedly.")
             report.num_replan = self._replan_count
             report.adversarial_rounds = self._adversarial_count
+            if report.status == "success" and any(r.status != AgentStatus.SUCCESS for r in self._results):
+                report.status = "partial"
 
             # M4: 将最终报告存入 SharedMemoryStore
-            if self.memory_store is not None:
+            if self.memory_store is not None and report.status == "success":
                 try:
                     from src.memory.long_term import MemoryEntry
                     entry = MemoryEntry(
-                        entry_id=f"final_report:{int(time.time())}",
+                        entry_id=f"{self._run_id}:final_report",
                         claim=self._smart_truncate(str(report.content), max_chars=1200),
                         source="orchestrator",
                         confidence=report.confidence,
@@ -173,7 +252,7 @@ class Orchestrator:
                             "adversarial_rounds": report.adversarial_rounds,
                         },
                     )
-                    self.memory_store.put(entry)
+                    await run_sync(self.memory_store.put, entry)
                     print(f"[M4] Final report stored to memory (confidence={report.confidence:.2f})")
 
                     # M3+L3: M4 容量 >85% 时用 LLM 摘要压缩旧记忆
@@ -184,12 +263,8 @@ class Orchestrator:
             return report
 
         # FAILED 状态
-        return ResearchReport(
-            query=query,
-            content="Research failed due to persistent errors or global timeout.",
-            num_replan=self._replan_count,
-            adversarial_rounds=self._adversarial_count,
-        )
+        return self._abort_report(ResearchAbort(Failure(5, "RESEARCH_FAILED",
+            self._memory_store.get("failure_reason", "规划失败或没有足够的可用结果，研究无法继续"), "research")))
 
     # ------------------------------------------------------------------
     # 状态机处理器
@@ -205,17 +280,20 @@ class Orchestrator:
         失败时直接转入 FAILED（初始计划失败无法恢复）。
         """
         try:
-            memory_ctx = self._build_memory_context()
-            self._dag = self.planner.generate_plan(self._query, memory_ctx)
+            memory_ctx = await self._build_memory_context()
+            # generate_plan 是协程：内部含「规划前侦察」的固定次数搜索循环
+            self._dag = await self.planner.generate_plan(self._query, memory_ctx)
             # 从 planner 获取完整的 SubTask 信息（包括 description、search_hints 等）
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
                 # 降级：如果解析失败，使用占位符
                 self._task_map = self._rebuild_task_map_from_dag()
         except PlanParseError as e:
+            self._memory_store["failure_reason"] = public_message(e)
             print(f"[Planning] Failed: {e}")
             return OrchestratorState.FAILED
         except Exception as e:
+            self._memory_store["failure_reason"] = public_message(e)
             print(f"[Planning] Unexpected error: {e}")
             return OrchestratorState.FAILED
 
@@ -241,12 +319,14 @@ class Orchestrator:
 
         semaphore = asyncio.Semaphore(self._config.max_concurrent)
         parallel_groups = self._dag.get_parallel_groups()
-        all_results: list[AgentResult] = []
+        all_results = {r.task_id: r for r in self._results
+                       if r.status == AgentStatus.SUCCESS and r.task_id not in self._task_map}
 
         for layer_idx, group in enumerate(parallel_groups):
             print(f"[Dispatch] ▶ Layer {layer_idx + 1}/{len(parallel_groups)}: {group} (并行执行)")
 
             # 构建本层的 coroutine 列表
+            @trace_chain(name="worker.task")
             async def _run_one(task_id: str) -> AgentResult:
                 async with semaphore:
                     subtask = self._task_map.get(task_id)
@@ -257,23 +337,42 @@ class Orchestrator:
                             output=f"SubTask '{task_id}' not found in task_map",
                         )
 
+                    if task_id in self._reusable_results:
+                        return self._reusable_results[task_id]
+
+                    record_event("task_started", {"task_id": task_id, "task_type": subtask.task_type.value,
+                                 "dependencies": subtask.dependencies, "replan_round": self._replan_count})
+                    unavailable = [dep for dep in subtask.dependencies
+                                   if not isinstance(self._memory_store.get(f"result:{dep}"), AgentResult)
+                                   or self._memory_store[f"result:{dep}"].status != AgentStatus.SUCCESS]
+                    if unavailable:
+                        return AgentResult(task_id=task_id, status=AgentStatus.SKIPPED,
+                                           output=f"Skipped: unsuccessful or missing dependencies: {', '.join(unavailable)}")
+
                     # 准备上下文：先执行依赖任务的结果
                     context = self._build_task_context(subtask)
 
                     # 获取 Agent
-                    agent = await self.agent_pool.get_agent(subtask.task_type)
+                    agent = None
+                    reusable = False
                     try:
-                        # 设置单任务超时
-                        result = await asyncio.wait_for(
-                            agent.run(subtask, context),
-                            timeout=subtask.timeout_seconds,
-                        )
+                        agent = await self.agent_pool.get_agent(subtask.task_type)
+                        with deadline_scope(seconds=subtask.timeout_seconds):
+                            result = await bounded(agent.run(subtask, context))
+                        reusable = result.status == AgentStatus.SUCCESS
                     except asyncio.TimeoutError:
-                        result = AgentResult(
+                        result = getattr(agent, "partial_result", None) or AgentResult(
                             task_id=task_id,
                             status=AgentStatus.TIMEOUT,
                             output=f"Task timed out after {subtask.timeout_seconds}s",
                         )
+                        result.status = AgentStatus.PARTIAL if getattr(agent, "partial_result", None) else AgentStatus.TIMEOUT
+                        result.recovery.update({"level": 4, "needs_replan": True, "code": "TASK_TIMEOUT"})
+                    except (ResearchAbort, asyncio.CancelledError):
+                        partial = getattr(agent, "partial_result", None)
+                        if partial:
+                            self._memory_store[f"result:{task_id}"] = partial
+                        raise
                     except Exception as e:
                         result = AgentResult(
                             task_id=task_id,
@@ -281,38 +380,45 @@ class Orchestrator:
                             output=f"Exception: {type(e).__name__}: {e}",
                         )
                     finally:
-                        await self.agent_pool.release_agent(agent)
+                        await self.agent_pool.release_agent(agent, reusable=reusable)
 
+                    # Publish each completion immediately, even if siblings are later cancelled.
+                    self._memory_store[f"result:{task_id}"] = result
                     return result
 
             # 并发执行本层
             coros = [_run_one(tid) for tid in group]
-            layer_results = await asyncio.gather(*coros, return_exceptions=True)
+            running = [asyncio.create_task(coro) for coro in coros]
+            try:
+                layer_results = await asyncio.gather(*running)
+            except BaseException:
+                # L5 and cancellation stop siblings immediately and drain their finally blocks.
+                for pending in running:
+                    if not pending.done():
+                        pending.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
 
             for lr in layer_results:
                 if isinstance(lr, Exception):
                     # 将异常包装为 FAILED 结果
-                    all_results.append(AgentResult(
-                        task_id="unknown",
-                        status=AgentStatus.FAILED,
-                        output=f"Dispatch exception: {lr}",
-                    ))
+                    all_results["unknown"] = AgentResult(
+                        task_id="unknown", status=AgentStatus.FAILED,
+                        output=f"Dispatch exception: {lr}")
                 else:
-                    all_results.append(lr)
+                    all_results[lr.task_id] = lr
                     # 每层结束后立即写入 _memory_store，使下层可见依赖结果
                     if isinstance(lr, AgentResult):
                         self._memory_store[f"result:{lr.task_id}"] = lr
 
-        self._results = all_results
+        self._results = list(all_results.values())
         return OrchestratorState.COLLECTING
 
     async def _do_collecting(self) -> OrchestratorState:
         """收集结果，写入 memory，检查是否需要重规划。
 
-        三级降级策略检查点:
-          - 单任务超时/失败：已在 dispatch 层处理（标记状态，继续执行）
-          - >50% 失败：触发 REPLANNING
-          - 全局超时：由外层 run() 的循环检查处理
+        L4 的唯一 Replan 入口：任何显式验收失败都进入既有重规划流程，
+        同时受 Replan 轮数与请求共享恢复预算限制。L5 在 run() 收敛。
         """
         # 将结果写入运行时 memory dict
         for r in self._results:
@@ -322,7 +428,7 @@ class Orchestrator:
         if self.memory_store is not None:
             for r in self._results:
                 if r.status == AgentStatus.SUCCESS and r.output:
-                    self._sync_result_to_memory_store(r)
+                    await run_sync(self._sync_result_to_memory_store, r)
 
         # M3: 对成功结果做提取式压缩（L2 TextRank），提升 Summarizer 输入质量
         if self.compressor is not None:
@@ -330,7 +436,7 @@ class Orchestrator:
             if success_indices:
                 success_outputs = [str(self._results[i].output) for i in success_indices]
                 try:
-                    compressed = self.compressor.compress_documents(
+                    compressed = await run_sync(self.compressor.compress_documents,
                         success_outputs, self._query, target_ratio=0.50
                     )
                     for j, idx in enumerate(success_indices):
@@ -355,12 +461,19 @@ class Orchestrator:
 
         # 检查是否需要重规划
         if self._should_replan(self._results):
-            if self._replan_count < self._config.max_replan_rounds:
+            state = current_recovery()
+            if (self._replan_count < self._config.max_replan_rounds
+                    and (state is None or state.action())):
                 self._replan_count += 1
+                record_event("task_recovery", {"level": 4, "action": "replan", "round": self._replan_count})
                 return OrchestratorState.REPLANNING
             else:
                 print("[Collect] Max replan rounds reached, proceeding with partial results")
                 # 超过最大重规划次数，继续合成（用已有结果）
+
+        if not any(r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output for r in self._results):
+            raise ResearchAbort(Failure(5, "NO_USABLE_EVIDENCE",
+                "任务恢复与重规划后仍无可用结果，研究停止；未调用模型补写报告", "research"))
 
         return OrchestratorState.SYNTHESIZING
 
@@ -391,7 +504,7 @@ class Orchestrator:
                 topic = self._query[:50]
 
             entry = MemoryEntry(
-                entry_id=result.task_id,
+                entry_id=f"{self._run_id}:{self._replan_count}:{result.task_id}",
                 claim=claim_text,
                 source=source,
                 confidence=getattr(result, "confidence", 0.5),
@@ -507,21 +620,24 @@ class Orchestrator:
         if self.memory_store is None or self.compressor is None:
             return
 
-        max_entries = 10000  # 与 config memory.max_entries 一致
+        max_entries = self.memory_store.max_entries
         current_count = len(self.memory_store)
         if current_count < max_entries * 0.85:
             return
 
         try:
             # 获取所有记忆，按时间排序
-            all_entries = self.memory_store.lt.get_all_entries()
+            all_entries = await run_sync(self.memory_store.list_entries)
+            all_entries = [e for e in all_entries
+                           if e.metadata.get("_memory", {}).get("status") != "disputed"
+                           and not e.metadata.get("pinned", False)]
             if len(all_entries) < 20:  # 太少不值得压缩
                 return
             all_entries.sort(key=lambda e: e.timestamp)
 
             # 保留最近 50%，压缩较旧 50%
-            keep_count = max(current_count // 2, 10)
-            old_entries = all_entries[: current_count - keep_count]
+            keep_count = max(len(all_entries) // 2, 10)
+            old_entries = all_entries[: len(all_entries) - keep_count]
 
             if len(old_entries) < 5:  # 旧记忆太少，不值得压缩
                 return
@@ -535,7 +651,7 @@ class Orchestrator:
             )
 
             # L3: 用 LLM 将旧记忆聚合为一份摘要
-            aggregate = self.compressor.summarizer.summarize_documents(
+            aggregate = await self.compressor.summarizer.asummarize_documents(
                 old_texts,
                 query=self._query,
                 max_length=max(800, min(3000, len(old_texts) * 30)),
@@ -545,23 +661,11 @@ class Orchestrator:
                 print("[M3] L3 compression produced empty result, skipping")
                 return
 
-            # 删除旧记忆（使用同一个连接）
-            conn = self.memory_store.lt._connect()
-            try:
-                for e in old_entries:
-                    self.memory_store._remove_from_index(e.entry_id)
-                    conn.execute(
-                        "DELETE FROM entries WHERE entry_id = ?", (e.entry_id,)
-                    )
-                conn.commit()
-            finally:
-                conn.close()
-
             # 插入压缩摘要作为新记忆
             from src.memory.long_term import MemoryEntry
             import time as _time
             compressed_entry = MemoryEntry(
-                entry_id=f"compressed:{int(_time.time())}",
+                entry_id=f"compressed:{uuid.uuid4().hex}",
                 claim=aggregate[:1200],
                 source="m3_compressor",
                 confidence=0.6,
@@ -575,7 +679,9 @@ class Orchestrator:
                     "original_timestamps": [e.timestamp for e in old_entries[:5]],
                 },
             )
-            self.memory_store.put(compressed_entry)
+            committed = await run_sync(self.memory_store.replace_entries, old_entries, compressed_entry)
+            if not committed:
+                return  # Sources changed or summary rejected; original memories remain intact.
 
             print(
                 f"[M3] Compressed {len(old_entries)} old memories into 1 summary entry "
@@ -608,20 +714,12 @@ class Orchestrator:
             "results": self._results,
         }
 
-        agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
-        # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent
-        # 这里我们通过类型检查或强制创建 SummarizerAgent
-        from ..agents.summarizer import SummarizerAgent
-        if not isinstance(agent, SummarizerAgent):
-            # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
-            policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools)
-
+        agent = await self.agent_pool.get_agent("synthesize")
+        reusable = False
         try:
-            result = await asyncio.wait_for(
-                agent.run(synth_task, context),
-                timeout=synth_task.timeout_seconds,
-            )
+            with deadline_scope(seconds=synth_task.timeout_seconds):
+                result = await bounded(agent.run(synth_task, context))
+            reusable = result.status == AgentStatus.SUCCESS
         except asyncio.TimeoutError:
             result = AgentResult(
                 task_id="synthesize_final",
@@ -641,7 +739,7 @@ class Orchestrator:
                     if r.task_id == task_id:
                         r.output = original
                         break
-            await self.agent_pool.release_agent(agent)
+            await self.agent_pool.release_agent(agent, reusable=reusable)
 
         if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
             self._memory_store["final_report"] = result.output
@@ -650,6 +748,7 @@ class Orchestrator:
             self._memory_store["final_report"] = ResearchReport(
                 query=self._query,
                 content=str(result.output) if result.output else "Synthesis failed.",
+                status="timeout" if result.status == AgentStatus.TIMEOUT else "failed",
                 confidence=0.0,
                 num_searches=sum(
                     len([t for t in r.trajectory if t.get("role") == "tool"])
@@ -674,7 +773,8 @@ class Orchestrator:
             return OrchestratorState.DONE
 
         # 置信度足够高时跳过对抗
-        if report.confidence >= 0.8:
+        self.pre_adversarial_report = copy.deepcopy(report)
+        if report.confidence >= 0.8 and not self.force_adversarial:
             print("[Adversarial] ✓ 报告置信度已达标 (≥0.8)，跳过对抗优化")
             return OrchestratorState.DONE
 
@@ -703,6 +803,7 @@ class Orchestrator:
             print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
         except Exception as e:
             print(f"[Adversarial] ✗ 对抗优化失败: {e}，使用原始报告")
+            pre_adversarial_report.status = "partial"
             self._memory_store["final_report"] = pre_adversarial_report
 
         return OrchestratorState.DONE
@@ -710,7 +811,7 @@ class Orchestrator:
     async def _do_replanning(self) -> OrchestratorState:
         """触发增量重规划。
 
-        保留 confidence≥0.6 的成功结果，修改失败子问题。
+        复用未变更且通过验收的结果，变更任务及其后代重新执行。
         """
         failed_tasks = []
         for r in self._results:
@@ -723,7 +824,10 @@ class Orchestrator:
         print(f"[Replan] Round {self._replan_count}/{self._config.max_replan_rounds}. Failed tasks: {[t.task_id for t in failed_tasks]}")
 
         try:
-            new_dag = self.planner.replan(
+            previous_tasks = dict(self._task_map)
+            previous_results = {r.task_id: r for r in self._results
+                if r.status == AgentStatus.SUCCESS and r.acceptance.get("passed", True)}
+            new_dag = await self.planner.areplan(
                 query=self._query,
                 failed_tasks=failed_tasks,
                 existing_results=self._results,
@@ -733,17 +837,33 @@ class Orchestrator:
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
                 self._task_map = self._rebuild_task_map_from_dag()
-            # 清空上一轮结果（保留在 memory 中，新任务可通过 context_keys 引用）
-            self._results = []
+            # Reuse only unchanged accepted tasks. Invalidate all descendants of a changed task.
+            changed = {key for key, task in self._task_map.items()
+                       if key not in previous_results or task != previous_tasks.get(key)}
+            while True:
+                descendants = {key for key, task in self._task_map.items()
+                               if set(task.dependencies).intersection(changed)}
+                expanded = changed | descendants
+                if expanded == changed:
+                    break
+                changed = expanded
+            self._reusable_results = {key: result for key, result in previous_results.items()
+                                      if key in self._task_map and key not in changed}
+            obsolete = {key for key in previous_tasks if key not in self._task_map and key not in previous_results}
+            for key in changed | obsolete:
+                self._memory_store.pop(f"result:{key}", None)
+                self._memory_store.pop(f"compressed:{key}", None)
+            self._results = [r for r in self._results if r.status == AgentStatus.SUCCESS
+                             and (r.task_id not in self._task_map or r.task_id in self._reusable_results)]
         except PlanParseError as e:
             print(f"[Replan] Failed: {e}")
             # 重规划失败，如果已有部分成功结果，尝试直接合成
-            if any(r.status == AgentStatus.SUCCESS for r in self._results):
+            if any(r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output for r in self._results):
                 return OrchestratorState.SYNTHESIZING
             return OrchestratorState.FAILED
         except Exception as e:
             print(f"[Replan] Unexpected error: {e}")
-            if any(r.status == AgentStatus.SUCCESS for r in self._results):
+            if any(r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output for r in self._results):
                 return OrchestratorState.SYNTHESIZING
             return OrchestratorState.FAILED
 
@@ -762,24 +882,9 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _should_replan(self, results: list[AgentResult]) -> bool:
-        """判断是否需要重规划。
-
-        策略:
-          - 失败率 > 50% 时触发
-          - 或存在任何 TIMEOUT 且成功结果不足 30%
-        """
-        if not results:
-            return False
-        total = len(results)
-        failed = sum(1 for r in results if r.status in (AgentStatus.FAILED, AgentStatus.TIMEOUT))
-        success = sum(1 for r in results if r.status == AgentStatus.SUCCESS)
-
-        failure_rate = failed / total
-        if failure_rate > 0.5:
-            return True
-        if success / total < 0.3 and failed > 0:
-            return True
-        return False
+        """Any rejected, failed, partial or skipped task requests the existing L4 Replan."""
+        return any(r.status != AgentStatus.SUCCESS or r.recovery.get("needs_replan")
+                   or r.acceptance.get("passed") is False for r in results)
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -788,9 +893,9 @@ class Orchestrator:
     def _is_global_timeout(self) -> bool:
         """检查是否超过全局超时。"""
         elapsed = time.monotonic() - self._start_time
-        return elapsed > self._config.global_timeout_seconds
+        return elapsed >= self._config.global_timeout_seconds
 
-    def _build_memory_context(self) -> str:
+    async def _build_memory_context(self) -> str:
         """构建给 planner 的上下文摘要。
 
         优先使用 M4 SharedMemoryStore 的语义检索（如果已接入），
@@ -799,7 +904,7 @@ class Orchestrator:
         # M4: 语义检索相关记忆
         if self.memory_store is not None:
             try:
-                ctx = self.memory_store.get_context_for_query(
+                ctx = await run_sync(self.memory_store.get_context_for_query,
                     self._query, max_tokens=3000  # 放宽限制，给 Compressor 更多素材
                 )
                 if ctx:
@@ -807,7 +912,7 @@ class Orchestrator:
                     # M3串联: 对 M4 的粗粒度结果做细粒度语义压缩
                     if self.compressor is not None:
                         try:
-                            compressed = self.compressor.compress(
+                            compressed = await self.compressor.acompress(
                                 texts=[ctx],
                                 query=self._query,
                                 level=2,  # L1+L2: 过滤无关记忆 + 提取关键句
@@ -834,7 +939,7 @@ class Orchestrator:
             total_chars = sum(len(p) for p in parts)
             if total_chars > 6000:  # 约 2000 tokens 的启发式阈值
                 try:
-                    compressed = self.compressor.compress(
+                    compressed = await self.compressor.acompress(
                         texts=parts,
                         query=self._query,
                         system_prompt_tokens=0,
@@ -889,12 +994,21 @@ class Orchestrator:
     def _build_failure_reason(self, results: list[AgentResult]) -> str:
         """分析失败原因，生成给 replanner 的描述。"""
         reasons = []
+        for result in results:
+            if result.recovery.get("needs_replan") or result.acceptance.get("passed") is False:
+                reasons.append(f"{result.task_id}: gaps={result.acceptance.get('gaps', [])}; "
+                               f"recovery={{'last_error': {result.recovery.get('last_error')}, "
+                               f"'tool_calls': {result.recovery.get('tool_calls')}, 'fallbacks': {result.recovery.get('fallbacks')}}}; "
+                               f"partial_output={str(result.output)[:1200]}")
         timeout_count = sum(1 for r in results if r.status == AgentStatus.TIMEOUT)
         failed_count = sum(1 for r in results if r.status == AgentStatus.FAILED)
+        skipped_count = sum(1 for r in results if r.status == AgentStatus.SKIPPED)
         if timeout_count > 0:
             reasons.append(f"{timeout_count} tasks timed out (may need simpler queries or longer timeout)")
         if failed_count > 0:
             reasons.append(f"{failed_count} tasks failed with errors")
+        if skipped_count > 0:
+            reasons.append(f"{skipped_count} tasks skipped because required dependencies did not succeed")
         return "; ".join(reasons) if reasons else "Unknown failure"
 
     def _rebuild_task_map_from_dag(self) -> dict[str, SubTask]:

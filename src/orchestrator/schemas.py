@@ -54,8 +54,10 @@ class TaskType(Enum):
 class AgentStatus(Enum):
     """单个 Sub-task 的执行结果状态。"""
     SUCCESS = "success"
+    PARTIAL = "partial"  # Useful output exists, but task acceptance did not pass.
     FAILED = "failed"
     TIMEOUT = "timeout"
+    SKIPPED = "skipped"  # A required upstream dependency did not succeed.
 
 
 # ============================================================================
@@ -106,6 +108,8 @@ class AgentResult:
     trajectory: list[dict] = field(default_factory=list)
     token_usage: int = 0
     confidence: float = 0.0
+    recovery: dict[str, Any] = field(default_factory=dict)
+    acceptance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +134,8 @@ class ResearchReport:
     num_replan: int = 0
     adversarial_rounds: int = 0
     final_score: float = 0.0
+    status: str = "success"  # success / partial / timeout / failed
+    recovery: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

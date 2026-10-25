@@ -1,0 +1,5 @@
+# 可选外部数据缓存
+
+本目录保留维护者下载的原始数据，缓存不随源码发布。项目已经提供版本化HotpotQA适配子集，常规快照评测无需整份parquet文件。
+
+如需重做导入，使用官方公开HotpotQA来源，并核对docs/EVALUATION_DATASET_V3.md记录的原始文件SHA256及导入协议，再运行scripts/import_hotpot_suite.py。不要用新的原始文件静默覆盖历史版本题集。

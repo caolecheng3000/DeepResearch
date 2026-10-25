@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from ..utils.execution import call_policy, bounded, check_deadline
+
 import json
 import re
 from typing import Any
@@ -28,8 +30,11 @@ class SummarizerAgent(BaseAgent):
         max_output_tokens: 报告生成的最大 token 数（通过 policy.max_tokens 控制）。
     """
 
-    def __init__(self, name: str, policy, tools: list | None = None) -> None:
+    def __init__(self, name: str, policy, tools: list | None = None, min_report_chars: int = 5000) -> None:
         super().__init__(name, policy, tools)
+        if min_report_chars < 0:
+            raise ValueError("min_report_chars must be nonnegative")
+        self.min_report_chars = min_report_chars
 
     @trace_agent(name="summarizer.run", tags=["agent", "summarizer"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -45,6 +50,7 @@ class SummarizerAgent(BaseAgent):
             AgentResult，output 字段为 ResearchReport 实例。
         """
         query = context.get("query", "")
+        self._used_fallback = False
         results: list[AgentResult] = context.get("results", [])
 
         if not results:
@@ -52,6 +58,7 @@ class SummarizerAgent(BaseAgent):
                 query=query,
                 content="No sub-task results available to synthesize.",
                 confidence=0.0,
+                status="failed",
             )
             return AgentResult(
                 task_id=task.task_id,
@@ -64,7 +71,7 @@ class SummarizerAgent(BaseAgent):
 
         # 预先计算 success_results（用于重试和降级）
         sorted_all = sorted(results, key=lambda r: r.confidence, reverse=True)
-        success_results = [r for r in sorted_all if r.status == AgentStatus.SUCCESS]
+        success_results = [r for r in sorted_all if r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output]
 
         # 构建 synthesis prompt
         prompt = self._build_synthesis_prompt(query, results, success_results)
@@ -78,9 +85,13 @@ class SummarizerAgent(BaseAgent):
             # 合成任务不需要工具调用，临时禁用 tools 避免模型进入 tool-calling 模式
             old_tools = getattr(self.policy, "tools", None)
             self.policy.tools = None
-            response = self.policy(messages)
-            self.policy.tools = old_tools
+            try:
+                response = await call_policy(self.policy, messages)
+            finally:
+                self.policy.tools = old_tools
             content = response.get("content", "") or ""
+        except TimeoutError:
+            raise
         except RuntimeError as e:
             # LLM 调用失败 → 直接用降级报告
             content = self._build_fallback_report(query, success_results)
@@ -91,7 +102,7 @@ class SummarizerAgent(BaseAgent):
         # 若是则用更强 prompt 重新生成，再失败则用降级报告
         if self._is_apology_output(content):
             if success_results:
-                content = self._retry_with_stronger_prompt(query, success_results)
+                content = await self._retry_with_stronger_prompt(query, success_results)
             else:
                 content = self._build_fallback_report(query, success_results)
 
@@ -103,6 +114,14 @@ class SummarizerAgent(BaseAgent):
 
         # 解析报告内容，提取来源和置信度
         report = self._parse_report(query, content, results)
+        if not success_results:
+            report.status = "failed"
+        elif self._used_fallback or any(r.status != AgentStatus.SUCCESS for r in results):
+            report.status = "partial"
+        gaps = [f"{r.task_id}: {', '.join(r.acceptance.get('gaps', [])) or r.status.value}"
+                for r in results if r.status != AgentStatus.SUCCESS]
+        if gaps:
+            report.content += "\n\n## 证据缺口与限制\n\n" + "\n".join(f"- {gap}" for gap in gaps)
 
         return AgentResult(
             task_id=task.task_id,
@@ -118,7 +137,7 @@ class SummarizerAgent(BaseAgent):
             "You are an expert research synthesizer. "
             "Your task is to integrate multiple research findings into a coherent, well-structured report. "
             "Use Markdown formatting. Cite sources explicitly. "
-            "The report body MUST be at least 5000 Chinese characters long. "
+            f"The report body should contain at least {self.min_report_chars} Chinese characters; follow the user's requested scope. "
             "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
             "Every section must have at least 2-3 substantial paragraphs. "
             "DO NOT describe what you will do — directly output the synthesized report. "
@@ -134,10 +153,9 @@ class SummarizerAgent(BaseAgent):
             "Your job is to synthesize available findings, not to apologize for missing data.\n"
             "2. NEVER mention 'API', 'API key', '搜索工具', 'search tool failure', or '无法搜索' in your report. "
             "These are system-level issues that the reader does NOT need to know about.\n"
-            "3. If some tasks failed or returned limited results, simply synthesize what IS available. "
-            "Do NOT explain why data might be missing.\n"
-            "4. ALWAYS produce a complete, substantive report regardless of input quality. "
-            "Even if findings are limited, organize and present them professionally.\n"
+            "3. If tasks failed or returned partial evidence, state the uncovered questions and evidence limitations. "
+            "Partial findings have not passed task acceptance; do not present them as verified conclusions.\n"
+            "4. Only include conclusions supported by the provided evidence. Never fill gaps to meet a length target.\n"
             "5. Output directly — do NOT include meta-commentary about the synthesis process.\n"
             "6. REQUIRED STRUCTURE: Your report MUST contain at least 4 ## level-2 sections "
             "(执行摘要, 背景, 关键发现, 结论与展望), "
@@ -153,7 +171,7 @@ class SummarizerAgent(BaseAgent):
         """
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
         if success_results is None:
-            success_results = [r for r in sorted_results if r.status == AgentStatus.SUCCESS]
+            success_results = [r for r in sorted_results if r.status in (AgentStatus.SUCCESS, AgentStatus.PARTIAL) and r.output]
         failed_results = [r for r in sorted_results if r.status != AgentStatus.SUCCESS]
 
         parts = [
@@ -162,14 +180,14 @@ class SummarizerAgent(BaseAgent):
 
         # 优先展示成功结果（让 LLM 聚焦于此）
         if success_results:
-            parts.append(f"# Successful Research Findings ({len(success_results)} tasks)\n")
+            parts.append(f"# Available Research Findings ({len(success_results)} tasks)\n")
             parts.append("⚠️ CRITICAL: Use ONLY the findings below to write the report. "
                          "IGNORE any error messages you see in the output — they are tool-level errors, "
                          "not research conclusions. The actual research data is embedded in the results.\n")
             for i, r in enumerate(success_results, 1):
                 parts.append(
                     f"## 子任务结果 {i} (置信度: {r.confidence:.2f})\n"
-                    f"任务: {r.task_id}\n"
+                    f"任务: {r.task_id}，状态: {r.status.value}，验收缺口: {r.acceptance.get('gaps', [])}\n"
                     f"输出:\n{r.output}\n"
                 )
         else:
@@ -181,14 +199,14 @@ class SummarizerAgent(BaseAgent):
             parts.append(
                 f"\n# Note: {len(failed_results)} task(s) did not complete successfully "
                 f"({', '.join(failed_task_ids)}). "
-                f"Focus ONLY on the successful findings above. "
+                f"State uncovered questions and evidence limitations; partial results are unverified. "
                 f"Do NOT apologize or mention API errors in the report.\n"
             )
 
         parts.append(
             "\n# Instructions\n"
             "1. Directly write the synthesized report in Chinese (中文). Do NOT say 'I will synthesize'.\n"
-            "2. The report MUST be comprehensive and detailed (at least 5000 Chinese characters).\n"
+            f"2. The report should cover the requested scope (at least {self.min_report_chars} Chinese characters).\n"
             "3. REQUIRED SECTIONS (all titles and content in Chinese, with ## headers, 200+ chars each):\n"
             "   - 执行摘要 (overview of all findings)\n"
             "   - 背景 (context and significance of the topic)\n"
@@ -202,8 +220,7 @@ class SummarizerAgent(BaseAgent):
             "   Example: 1. [Attention Is All You Need](https://arxiv.org/abs/1706.03762) — 提出Transformer架构\n"
             "   Do NOT use plain text lists without Markdown links. Do NOT use '关键来源列表' as section title.\n"
             "6. End with: 整体置信度: X.XX\n"
-            "7. CRITICAL: NEVER output an apology, disclaimer about API errors, or statement that you couldn't find information. "
-            "ALWAYS synthesize a complete report from the available findings, even if some tasks failed.\n"
+            "7. Explicitly state evidence gaps and unresolved questions. Never invent findings to complete the report.\n"
             "8. If the outputs contain research content mixed with error messages, extract ONLY the research content and ignore the errors.\n"
             "9. LANGUAGE: The ENTIRE report MUST be in Chinese. Only paper titles in references may remain in English."
         )
@@ -232,7 +249,7 @@ class SummarizerAgent(BaseAgent):
         # 收集来源（从各个子结果的轨迹中提取）
         sources: list[dict] = []
         for r in results:
-            if r.status != AgentStatus.SUCCESS:
+            if r.status not in (AgentStatus.SUCCESS, AgentStatus.PARTIAL):
                 continue
             # 简单启发式：从 trajectory 的 tool 结果中提取 url
             for step in r.trajectory:
@@ -334,7 +351,7 @@ class SummarizerAgent(BaseAgent):
 
         return False
 
-    def _retry_with_stronger_prompt(self, query: str, success_results: list) -> str:
+    async def _retry_with_stronger_prompt(self, query: str, success_results: list) -> str:
         """用更强硬的 prompt 重新生成报告。
 
         移除所有可能暗示失败的内容，仅传入净化的成功结果。
@@ -346,22 +363,21 @@ class SummarizerAgent(BaseAgent):
         for i, r in enumerate(success_results, 1):
             output = str(r.output) if r.output else ""
             # 进一步清理：移除常见的工具失败前缀
-            output = self._sanitize_output(output)
-            clean_parts.append(f"## Data {i}\n{output}\n")
+            clean_parts.append(f"## Data {i} ({r.status.value}; gaps={r.acceptance.get('gaps', [])})\n{output}\n")
 
         clean_parts.append(
             "\n# YOUR TASK\n"
             "Write a COMPLETE, LONG research report using ONLY the data above. "
             "Rules:\n"
             "1. Output the report DIRECTLY — no meta-commentary, no disclaimers, no preambles.\n"
-            "2. Minimum 5000 Chinese characters. The report MUST be LONG and COMPREHENSIVE.\n"
+            f"2. Cover the requested scope with at least {self.min_report_chars} Chinese characters.\n"
             "3. Required sections (use ## headers, 200+ chars each): Executive Summary, Background, "
             "Key Findings (3+ subsections), Comparative Analysis, Implications & Outlook, Conclusion.\n"
             "4. Write DETAILED analysis in each section — at least 300 chars per section.\n"
             "5. DO NOT mention 'API', 'search key', 'tool failure', or any system errors.\n"
             "6. End with '## 参考来源' section using Markdown links: N. [Title](URL) — brief description\n"
             "7. End the report with: 整体置信度: X.XX\n"
-            "8. THIS IS YOUR FINAL OPPORTUNITY — a short answer is UNACCEPTABLE.\n"
+            "8. State evidence gaps. Do not invent content to satisfy the length target. Partial data is unverified.\n"
             "9. Start writing the report NOW. First line must be a ## heading."
         )
         prompt = "\n".join(clean_parts)
@@ -381,14 +397,18 @@ class SummarizerAgent(BaseAgent):
         try:
             old_tools = getattr(self.policy, "tools", None)
             self.policy.tools = None
-            response = self.policy(messages)
-            self.policy.tools = old_tools
+            try:
+                response = await call_policy(self.policy, messages)
+            finally:
+                self.policy.tools = old_tools
             content = response.get("content", "") or ""
 
             # 如果重试后仍然是道歉，强制构造降级报告
             if self._is_apology_output(content):
                 return self._build_fallback_report(query, success_results)
             return content
+        except TimeoutError:
+            raise
         except Exception:
             return self._build_fallback_report(query, success_results)
 
@@ -412,6 +432,7 @@ class SummarizerAgent(BaseAgent):
 
         输出格式与正常报告一致（中文标题、编号引用来源），而非 "Finding" 格式。
         """
+        self._used_fallback = True
         parts = [f"# 研究报告：{query}\n\n"]
         parts.append("## 执行摘要\n\n")
         parts.append("本报告基于多个来源的研究发现综合而成。")
@@ -420,9 +441,8 @@ class SummarizerAgent(BaseAgent):
         parts.append("## 关键发现\n\n")
         for i, r in enumerate(success_results, 1):
             output = str(r.output)[:1000] if r.output else ""
-            output = self._sanitize_output(output)
             if output:
-                parts.append(f"### {i}. {r.task_id}\n\n")
+                parts.append(f"### {i}. {r.task_id}（{r.status.value}）\n\n")
                 parts.append(f"{output}\n\n")
 
         # 从 trajectory 提取真实引用来源
@@ -440,10 +460,8 @@ class SummarizerAgent(BaseAgent):
             parts.append("\n")
 
         parts.append("## 结论\n\n")
-        parts.append("基于以上研究发现，该领域呈现活跃的发展态势，")
-        parts.append("多个方向均有进一步研究的价值。")
-        parts.append("建议持续关注新进展并扩展覆盖范围。\n\n")
-        parts.append("整体置信度: 0.50")
+        parts.append("以上仅保留已有结果，未完成完整报告生成与最终核验；未验收的部分结果不能视为确定结论。\n\n")
+        parts.append("整体置信度: 0.00")
 
         return "".join(parts)
 

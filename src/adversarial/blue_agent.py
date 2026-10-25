@@ -10,6 +10,8 @@ Blue Agent 接收 Red Agent 的 Verdict，按优先级排序并执行三类修�
 """
 from __future__ import annotations
 
+from ..utils.execution import call_policy, bounded, check_deadline, run_sync
+
 import copy
 import logging
 from typing import Any
@@ -23,7 +25,7 @@ from src.adversarial.verdict import (
     VerdictEngine,
 )
 from src.orchestrator.schemas import ResearchReport
-from src.utils.tracing import trace_agent
+from src.utils.tracing import trace_agent, record_event
 
 
 logger = logging.getLogger(__name__)
@@ -174,10 +176,14 @@ class BlueAgent:
         "报告已截断", "仅显示前",  # 截断标记污染
     ]
 
-    def __init__(self, policy, tools: list[Any] | None = None, max_tokens: int = 4096):
+    def __init__(self, policy, tools: list[Any] | None = None, max_tokens: int | None = None,
+                 max_issues_per_round: int | None = None):
         self.policy = policy
         self.tools = tools or []
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens if max_tokens is not None else getattr(policy, "max_tokens", 8192)
+        if max_issues_per_round is not None and (type(max_issues_per_round) is not int or max_issues_per_round < 1):
+            raise ValueError("max_issues_per_round must be positive or None")
+        self.max_issues_per_round = max_issues_per_round
         # 缓存搜索工具
         self._search_tool = self._find_search_tool()
 
@@ -232,6 +238,13 @@ class BlueAgent:
             key=lambda issue: VerdictEngine.compute_priority(issue),
             reverse=True,
         )
+        if self.max_issues_per_round is not None:
+            deferred = sorted_issues[self.max_issues_per_round:]
+            sorted_issues = sorted_issues[:self.max_issues_per_round]
+            operations.extend(FixOperation(issue=issue, action="budget_deferred", success=False,
+                detail="Deferred by configured per-round repair budget; not resolved") for issue in deferred)
+            record_event("blue_repair_budget", {"total_issues": len(verdict.issues),
+                "selected": len(sorted_issues), "deferred": len(deferred)})
 
         supplementary_count = 0  # SUPPLEMENTARY 修复计数器（每轮最多 3 次）
         verify_reject_count: dict[str, int] = {}  # 每个 issue 被 verify 拒绝的次数
@@ -396,7 +409,7 @@ class BlueAgent:
         )
 
         async def _call(msgs):
-            return self.policy(msgs)
+            return await call_policy(self.policy, msgs)
 
         data = await retry_with_schema_feedback(
             policy_call=_call,
@@ -448,27 +461,25 @@ class BlueAgent:
         self, report: ResearchReport, issue: Issue
     ) -> FixOperation:
         """执行补充搜索后修正。"""
+        from src.utils.recovery import ToolExecutor, current_recovery
         search_results = ""
         if self._search_tool is not None:
             try:
-                # 假设搜索工具有 async execute 或同步 execute 接口
                 query = issue.description
-                if hasattr(self._search_tool, "execute"):
-                    if hasattr(self._search_tool.execute, "__call__"):
-                        import inspect
-                        if inspect.iscoroutinefunction(self._search_tool.execute):
-                            sr = await self._search_tool.execute(query)
-                        else:
-                            sr = self._search_tool.execute(query)
-                    else:
-                        sr = None
-                else:
-                    sr = None
-                search_results = str(sr) if sr else "（搜索工具未返回结果）"
+                executor = getattr(self, "_search_executor", None)
+                if executor is None or executor.state is not current_recovery():
+                    executor = self._search_executor = ToolExecutor([self._search_tool])
+                outcome = await executor.run(self._search_tool.name, {"query": query})
+                if outcome.status not in ("success", "partial"):
+                    return FixOperation(issue=issue, action="supplementary_search_failed", success=False,
+                                        detail=str(outcome.to_dict()))
+                search_results = str(outcome.data)
+            except TimeoutError:
+                raise
             except Exception as e:
-                search_results = f"（搜索失败: {e}）"
+                return FixOperation(issue=issue, action="supplementary_search_failed", success=False, detail=str(e))
         else:
-            search_results = "（无可用搜索工具）"
+            return FixOperation(issue=issue, action="supplementary_search_failed", success=False, detail="无可用搜索工具")
 
         prompt = PROMPT_SUPPLEMENTARY_SEARCH
         prompt = prompt.replace("{issue_desc}", issue.description)
@@ -551,7 +562,7 @@ class BlueAgent:
             {"role": "system", "content": SYSTEM_BLUE_AGENT},
             {"role": "user", "content": prompt},
         ]
-        resp = self.policy(messages)
+        resp = await call_policy(self.policy, messages)
         raw = resp.content or ""
 
         try:
